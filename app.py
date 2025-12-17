@@ -7,237 +7,213 @@ from retry_requests import retry
 import altair as alt
 from geopy.geocoders import Nominatim
 
-# --- 1. CONFIGURATION & PAGE SETUP ---
+# --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Climate Risk Dashboard", layout="wide")
-
-st.markdown("""
-<style>
-    .reportview-container {
-        background: #f0f2f6
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown("""<style>.reportview-container { background: #f0f2f6 }</style>""", unsafe_allow_html=True)
 
 st.title("🌍 Climate Risk & Resilience Dashboard")
-st.markdown("Generate a location-specific risk profile using **Copernicus ERA5 Reanalysis (1991-2020)** and **CMIP6 Projections**.")
+st.markdown("""
+**Decadal Risk Pathway Analysis**
+* **Baseline:** 1991–2020 (ERA5 Reanalysis)
+* **Future:** 2021–2050 (CMIP6 / MPI-ESM1-2-XR), broken down by decade.
+""")
 
-# --- 2. SIDEBAR INPUTS ---
+# --- 2. INPUTS ---
 with st.sidebar:
     st.header("📍 Location Parameters")
     lat = st.number_input("Latitude", value=51.5074, format="%.4f", min_value=-90.0, max_value=90.0)
     lon = st.number_input("Longitude", value=-0.1278, format="%.4f", min_value=-180.0, max_value=180.0)
-    
     st.markdown("---")
-    st.markdown("**Data Sources:**")
-    st.caption("• Historical: ERA5 Reanalysis (Open-Meteo)")
-    st.caption("• Projections: CMIP6 (SSP Scenarios)")
-    st.caption("• Risk Logic: Simulated WRI Aqueduct")
-    
+    st.caption("✅ **Live Data:** Decadal slices from 2021-2050")
+    st.caption("⚠️ **Simulated:** Risk Labels (High/Med/Low)")
     run_btn = st.button("Generate Risk Analysis", type="primary")
 
-# --- 3. HELPER FUNCTIONS ---
+# --- 3. DATA ENGINE ---
 
 @st.cache_data
 def get_location_name(lat, lon):
-    """
-    Reverse geocodes coordinates to find the country and state/region.
-    """
     try:
         geolocator = Nominatim(user_agent="climate_risk_app")
         location = geolocator.reverse((lat, lon), language='en')
         address = location.raw.get('address', {})
-        country = address.get('country', 'Unknown Country')
-        state = address.get('state', address.get('region', ''))
-        return f"{state}, {country}" if state else country
-    except Exception:
+        return f"{address.get('state', '')}, {address.get('country', 'Unknown')}"
+    except:
         return "Unknown Location"
 
 @st.cache_data
-def get_climate_data(latitude, longitude):
-    """
-    Fetches 30 years of daily data (1991-2020) from Open-Meteo.
-    """
+def get_climate_data(lat, lon):
+    # Setup Client
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600*24)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
-    # Fetch Historical Baseline (1991-2020)
+    # 1. BASELINE (1991-2020)
     url_hist = "https://archive-api.open-meteo.com/v1/archive"
     params_hist = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "start_date": "1991-01-01",
-        "end_date": "2020-12-31",
+        "latitude": lat, "longitude": lon,
+        "start_date": "1991-01-01", "end_date": "2020-12-31",
+        "daily": ["temperature_2m_mean", "precipitation_sum"]
+    }
+    
+    # 2. FUTURE (2021-2050)
+    url_pro = "https://climate-api.open-meteo.com/v1/climate"
+    params_pro = {
+        "latitude": lat, "longitude": lon,
+        "start_date": "2021-01-01", "end_date": "2050-12-31",
+        "models": "MPI_ESM1_2_XR",
         "daily": ["temperature_2m_mean", "precipitation_sum"],
-        "timezone": "auto"
+        "disable_bias_correction": "true" 
     }
 
     try:
-        responses = openmeteo.weather_api(url_hist, params=params_hist)
-        response = responses[0]
+        # -- Execute Historical --
+        hist_resp = openmeteo.weather_api(url_hist, params=params_hist)[0]
         
-        daily = response.Daily()
-        daily_temp = daily.Variables(0).ValuesAsNumpy()
-        daily_precip = daily.Variables(1).ValuesAsNumpy()
+        # -- Execute Future Scenarios --
+        future_data = {}
+        scenarios_to_fetch = {
+            "ssp1_2_6": "SSP1-2.6 (Ambitious)",
+            "ssp2_4_5": "SSP2-4.5 (Optimistic)",
+            "ssp3_7_0": "SSP3-7.0 (BAU)"
+        }
         
-        date_range = pd.date_range(
-            start=pd.to_datetime(daily.Time(), unit="s", origin="unix"),
-            end=pd.to_datetime(daily.TimeEnd(), unit="s", origin="unix"),
-            freq=pd.Timedelta(seconds=daily.Interval()),
-            inclusive="left"
-        )
+        for sc_key, sc_name in scenarios_to_fetch.items():
+             p = params_pro.copy()
+             p["scenarios"] = [sc_key]
+             f_resp = openmeteo.weather_api(url_pro, params=p)[0]
+             
+             # Process Daily Data
+             f_daily = f_resp.Daily()
+             f_dates = pd.to_datetime(f_daily.Time(), unit="s", origin="unix")
+             f_temps = f_daily.Variables(0).ValuesAsNumpy()
+             f_precip = f_daily.Variables(1).ValuesAsNumpy()
+             
+             # Create DataFrame for Slicing
+             df_f = pd.DataFrame({"temp": f_temps, "precip": f_precip}, index=f_dates)
+             
+             # Decadal Slicing
+             decades = {
+                 "2020s (2021-30)": df_f['2021':'2030'],
+                 "2030s (2031-40)": df_f['2031':'2040'],
+                 "2040s (2041-50)": df_f['2041':'2050']
+             }
+             
+             future_data[sc_name] = {}
+             for d_name, d_df in decades.items():
+                 if not d_df.empty:
+                     future_data[sc_name][d_name] = {
+                         "temp": d_df["temp"].mean(),
+                         "precip": d_df["precip"].sum() / 10.0 # Annual avg
+                     }
+
+        # -- Process Historical Baseline --
+        h_daily = hist_resp.Daily()
+        h_temps = h_daily.Variables(0).ValuesAsNumpy()
+        h_precips = h_daily.Variables(1).ValuesAsNumpy()
         
-        df = pd.DataFrame(data={"temp": daily_temp, "precip": daily_precip}, index=date_range)
+        baseline_temp = h_temps.mean()
+        baseline_precip = h_precips.sum() / 30.0 
         
-        # Baselines
-        baseline_temp = df["temp"].mean()
-        baseline_precip_annual = df["precip"].sum() / 30.0 
-        
-        # Monthly Climatology
-        df["month"] = df.index.month
-        monthly_avg = df.groupby("month").agg({"temp": "mean", "precip": "mean"})
-        
-        # Approximate monthly total precip (Daily Mean * 30.4 days)
-        monthly_avg["precip_total"] = monthly_avg["precip"] * 30.437
-        
+        # Monthly Data for Chart
+        dates = pd.to_datetime(h_daily.Time(), unit="s", origin="unix")
+        df_h = pd.DataFrame({"temp": h_temps, "precip": h_precips}, index=dates)
+        monthly = df_h.groupby(df_h.index.month).agg({"temp": "mean", "precip": "mean"})
+        monthly["precip_total"] = monthly["precip"] * 30.44
+
         return {
             "baseline_temp": baseline_temp,
-            "baseline_precip": baseline_precip_annual,
-            "monthly_data": monthly_avg
+            "baseline_precip": baseline_precip,
+            "future": future_data,
+            "monthly": monthly
         }
 
     except Exception as e:
-        st.error(f"API Connection Error: {e}")
+        st.error(f"Data Fetch Error: {e}")
         return None
 
-def calculate_risk_scenarios(climate_data):
-    base_t = climate_data["baseline_temp"]
-    base_p = climate_data["baseline_precip"]
+def calculate_risk_table(data):
+    b_t = data["baseline_temp"]
+    b_p = data["baseline_precip"]
     
-    is_hot = base_t > 20
-    is_dry = base_p < 500
-    
-    water_stress = "High" if is_dry else "Medium"
-    wildfire = "High" if (is_hot and is_dry) else "Low"
-    flood = "High" if base_p > 1500 else "Low"
-    
-    data = [
-        {
-            "index": "Current (1991-2020)",
-            "Temperature (°C)": f"{base_t:.2f}",
-            "Precipitation (mm)": f"{base_p:.1f}",
-            "Water Stress": water_stress,
-            "Drought Risk": "Medium" if is_dry else "Low",
-            "Flood Risk": flood,
-            "Cyclone Risk": "Low",
-            "Wildfire Risk": wildfire
-        },
-        {
-            "index": "+20Y Ambitious (SSP1-2.6)",
-            "Temperature (°C)": "+1.1°C",
-            "Precipitation (mm)": "+2.1%",
-            "Water Stress": water_stress,
-            "Drought Risk": "Medium",
-            "Flood Risk": flood,
-            "Cyclone Risk": "Low",
-            "Wildfire Risk": wildfire
-        },
-        {
-            "index": "+20Y Optimistic (SSP2-4.5)",
-            "Temperature (°C)": "+1.5°C",
-            "Precipitation (mm)": "-1.2%",
-            "Water Stress": "High",
-            "Drought Risk": "High",
-            "Flood Risk": "Low",
-            "Cyclone Risk": "Low",
-            "Wildfire Risk": "Medium"
-        },
-        {
-            "index": "+20Y Business As Usual (SSP3-7.0)",
-            "Temperature (°C)": "+2.1°C",
-            "Precipitation (mm)": "-4.5%",
-            "Water Stress": "Extr.",
-            "Drought Risk": "Extr.",
-            "Flood Risk": "Medium",
-            "Cyclone Risk": "Med",
-            "Wildfire Risk": "High"
-        }
-    ]
-    return pd.DataFrame(data).set_index("index")
+    # Risk Logic
+    def get_labels(t, p):
+        drought = "High" if p < 500 else ("Medium" if p < 800 else "Low")
+        flood = "High" if p > 1200 else ("Medium" if p > 800 else "Low")
+        wildfire = "High" if (t > 15 and p < 600) else "Low"
+        return drought, flood, wildfire
 
-def plot_climograph(monthly_data):
-    source = monthly_data.reset_index()
-    source['month_name'] = pd.to_datetime(source['month'], format='%m').dt.month_name().str.slice(stop=3)
+    rows = []
     
-    # We use 'datum' to manually force a legend for the two different mark types
-    base = alt.Chart(source).encode(x=alt.X('month_name', sort=None, title='Month'))
+    # 1. Current Row
+    d, f, w = get_labels(b_t, b_p)
+    rows.append({
+        "Scenario": "Current Baseline",
+        "Decade": "1991-2020",
+        "Temp": f"{b_t:.2f} °C",
+        "Precip": f"{b_p:.0f} mm",
+        "Water Stress": "Medium" if b_p < 1000 else "Low",
+        "Drought": d, "Flood": f, "Cyclone": "Low", "Wildfire": w
+    })
+    
+    # 2. Future Rows (Loop Scenarios -> Loop Decades)
+    for sc_name, decades in data["future"].items():
+        for dec_name, metrics in decades.items():
+            
+            delta_t = metrics["temp"] - b_t
+            delta_p_pct = ((metrics["precip"] - b_p) / b_p) * 100
+            
+            fd, ff, fw = get_labels(metrics["temp"], metrics["precip"])
+            
+            rows.append({
+                "Scenario": sc_name,
+                "Decade": dec_name,
+                "Temp": f"{'+' if delta_t>0 else ''}{delta_t:.2f} °C",
+                "Precip": f"{'+' if delta_p_pct>0 else ''}{delta_p_pct:.1f} %",
+                "Water Stress": "High" if metrics["precip"] < 1000 else "Low",
+                "Drought": fd, "Flood": ff, "Cyclone": "Low", "Wildfire": fw
+            })
 
-    bar = base.mark_bar(opacity=0.6).encode(
-        y=alt.Y('precip_total', title='Precipitation (mm)'),
-        color=alt.value("#4c78a8")  # Blue
-    )
-    
-    line = base.mark_line(strokeWidth=3).encode(
-        y=alt.Y('temp', title='Temperature (°C)'),
-        color=alt.value("#e45756")  # Red
-    )
-    
-    # Create the combined chart with independent axes
-    chart = alt.layer(bar, line).resolve_scale(y='independent').properties(
-        title="Climatological Normals (1991-2020)"
-    )
-    
-    return chart
+    return pd.DataFrame(rows)
 
-def color_risk_table(val):
-    val_str = str(val)
-    if 'High' in val_str or 'Extr' in val_str:
-        return 'background-color: #ffcccc; color: black'
-    elif 'Med' in val_str:
-        return 'background-color: #fff4cc; color: black'
-    elif 'Low' in val_str:
-        return 'background-color: #e6ffcc; color: black'
+# --- 4. VISUALIZATION ---
+def plot_chart(monthly):
+    src = monthly.reset_index()
+    src['month_name'] = pd.to_datetime(src['index'], format='%m').dt.month_name().str.slice(stop=3)
+    base = alt.Chart(src).encode(x=alt.X('month_name', sort=None, title='Month'))
+    bar = base.mark_bar(opacity=0.5, color='#4c78a8').encode(y='precip_total', tooltip='precip_total')
+    line = base.mark_line(color='#e45756', strokeWidth=3).encode(y='temp', tooltip='temp')
+    return alt.layer(bar, line).resolve_scale(y='independent').properties(title="Seasonal Baseline (1991-2020)")
+
+def style_rows(val):
+    s = str(val)
+    if 'High' in s: return 'background-color: #ffcccc; color: black'
+    if 'Med' in s: return 'background-color: #fff4cc; color: black'
+    if 'Low' in s: return 'background-color: #ccffcc; color: black'
     return ''
 
-# --- 4. MAIN APP LOGIC ---
-
+# --- 5. MAIN ---
 if run_btn:
-    with st.spinner(f"Analyzing climate records for {lat}, {lon}..."):
-        # 1. Fetch Data
-        climate_data = get_climate_data(lat, lon)
-        location_name = get_location_name(lat, lon)
-        
-        if climate_data:
-            # --- MAP & LOCATION HEADER ---
-            st.subheader(f"📍 Analysis for: {location_name}")
+    with st.spinner("Fetching Decadal Projections..."):
+        data = get_climate_data(lat, lon)
+        if data:
+            st.subheader(f"📍 Analysis for: {get_location_name(lat, lon)}")
+            st.map(pd.DataFrame({'lat':[lat], 'lon':[lon]}), zoom=4)
             
-            # Map Visualization (Simple Dot on Map)
-            map_data = pd.DataFrame({'lat': [lat], 'lon': [lon]})
-            st.map(map_data, zoom=4)
+            c1, c2 = st.columns(2)
+            c1.metric("Baseline Temp", f"{data['baseline_temp']:.1f}°C")
+            c2.metric("Baseline Precip", f"{data['baseline_precip']:.0f}mm")
             
-            # --- TOP METRICS ---
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Historical Avg Temp", f"{climate_data['baseline_temp']:.1f} °C", delta="1991-2020 Baseline")
-            with col2:
-                st.metric("Historical Annual Precip", f"{climate_data['baseline_precip']:.0f} mm", delta="30 Year Avg")
+            st.markdown("### 🔮 Decadal Risk Pathways")
+            df = calculate_risk_table(data)
             
-            # --- RISK TABLE ---
-            st.markdown("### Overall Risk Assessment")
-            df_risk = calculate_risk_scenarios(climate_data)
             st.dataframe(
-                df_risk.style.applymap(color_risk_table),
+                df.style.applymap(style_rows), 
                 use_container_width=True,
-                column_config={"index": "Scenario"}
+                column_order=["Scenario", "Decade", "Temp", "Precip", "Water Stress", "Drought", "Flood", "Wildfire"]
             )
             
-            # --- CLIMOGRAPH ---
-            st.markdown("### Seasonal Climate Profile")
-            st.caption("🟦 Blue Bars = Precipitation (Left Axis) | 🟥 Red Line = Temperature (Right Axis)")
-            chart = plot_climograph(climate_data['monthly_data'])
-            st.altair_chart(chart, use_container_width=True)
-            
+            st.altair_chart(plot_chart(data['monthly']), use_container_width=True)
         else:
-            st.error("Could not retrieve data. Please check coordinates.")
+            st.error("Data Unavailable.")
 else:
     st.info("👈 Enter Latitude/Longitude in the sidebar and click 'Generate' to start.")
