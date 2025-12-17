@@ -1,15 +1,16 @@
 import streamlit as st
 import pandas as pd
 import requests
-import time
+import altair as alt
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="Climate Risk Dashboard", layout="wide")
-st.title("🌍 Climate Risk Dashboard")
+# --- 1. SETUP ---
+st.set_page_config(page_title="Climate Risk Analysis (Clean)", layout="wide")
+
+st.title("🌍 Climate Risk Analysis: Clean Slate")
 st.markdown("""
-**Robust Analysis Mode**
-* **Climate Model:** MPI-ESM1-2-XR (Standard CMIP6)
-* **Water Risk:** WRI Aqueduct 4.0 (Hardcoded Table Search)
+This dashboard fetches raw climate data with **strict isolation** to ensure scenario divergence is real.
+* **Climate:** EC-Earth3P-HR (High Res) | 2024–2100
+* **Water:** WRI Aqueduct 4.0 | Spatial Buffer Search
 """)
 
 # --- 2. INPUTS ---
@@ -17,133 +18,134 @@ with st.sidebar:
     st.header("📍 Location")
     lat = st.number_input("Latitude", value=51.5074, format="%.4f")
     lon = st.number_input("Longitude", value=-0.1278, format="%.4f")
-    run_btn = st.button("Generate Analysis", type="primary")
+    
+    st.markdown("---")
+    st.caption("Pressing this forces fresh API calls.")
+    run_btn = st.button("Run New Analysis", type="primary")
 
-# --- 3. ROBUST DATA ENGINE ---
+# --- 3. CLIMATE ENGINE (STRICT ISOLATION) ---
 
-def get_climate_data_robust(lat, lon):
-    # API Endpoint
+def fetch_scenario(lat, lon, scenario_code, scenario_label):
+    """
+    Fetches a SINGLE scenario to ensure no parameter bleeding/caching issues.
+    """
     url = "https://climate-api.open-meteo.com/v1/climate"
     
-    # We use MPI_ESM1_2_XR because we KNOW it works for these dates
-    base_params = {
-        "latitude": lat, "longitude": lon,
-        "start_date": "2021-01-01", "end_date": "2050-12-31",
-        "models": "MPI_ESM1_2_XR",
+    # We request data up to 2100 to SEE the divergence
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": "2024-01-01",
+        "end_date": "2099-12-31",
+        "models": "EC_Earth3P_HR",
+        "scenarios": scenario_code,
         "daily": ["temperature_2m_mean", "precipitation_sum"],
-        "disable_bias_correction": "true"
+        "disable_bias_correction": "true" 
     }
     
-    results = {}
-    
-    # Scenarios to fetch
-    scenarios = ["ssp1_2_6", "ssp2_4_5", "ssp3_7_0"]
-    
-    for sc in scenarios:
-        # Create unique parameters for this SPECIFIC scenario
-        # We add 'cache_buster' to ensure the API doesn't return the previous loop's result
-        params = base_params.copy()
-        params["scenarios"] = sc
-        params["_cb"] = int(time.time() * 1000) + scenarios.index(sc)
+    try:
+        r = requests.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
         
-        try:
-            r = requests.get(url, params=params)
-            r.raise_for_status() # Raise error if 400/500
-            data = r.json()
-            
-            # Extract
-            temps = data.get('daily', {}).get('temperature_2m_mean', [])
-            precips = data.get('daily', {}).get('precipitation_sum', [])
-            
-            # Math Helper: Filter None values
-            valid_temps = [x for x in temps if x is not None]
-            valid_precips = [x for x in precips if x is not None]
-            
-            if not valid_temps:
-                results[sc] = {"temp": "No Data", "precip": "No Data"}
-            else:
-                avg_temp = sum(valid_temps) / len(valid_temps)
-                # Annual Precip = (Total Sum / Days) * 365
-                avg_precip = (sum(valid_precips) / len(valid_precips)) * 365.25
-                
-                results[sc] = {
-                    "temp": avg_temp, 
-                    "precip": avg_precip
-                }
-                
-        except Exception as e:
-            results[sc] = {"temp": f"Err: {str(e)[:20]}", "precip": "Err"}
-
-    return results
-
-def get_water_stress_robust(lat, lon):
-    # We confirmed this table name in your previous logs. 
-    # Hardcoding it removes the "Metadata Fetch" point of failure.
-    TABLE_NAME = "wat_050_aqueduct_baseline_water_stress"
-    
-    # We try 3 search radii: 1km (exact), 50km (near), 500km (regional)
-    radii = [0.01, 0.5, 5.0] 
-    
-    for r in radii:
-        sql = f"""
-            SELECT bws_label, bws_score 
-            FROM {TABLE_NAME} 
-            WHERE ST_DWithin(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326), {r}) 
-            LIMIT 1
-        """
-        url = f"https://api.resourcewatch.org/v1/query?sql={sql}"
+        # Parse Dates
+        daily = data.get('daily', {})
+        dates = pd.to_datetime(daily.get('time', []))
+        temps = daily.get('temperature_2m_mean', [])
+        precips = daily.get('precipitation_sum', [])
         
-        try:
-            resp = requests.get(url)
-            data = resp.json().get('data', [])
-            if data:
-                val = data[0].get('bws_label', 'Unknown')
-                # If we had to search far (0.5 or 5.0), add a note
-                if r > 0.01:
-                    return f"{val} (Regional Match)"
-                return val
-        except:
-            continue # Try next radius
-            
-    return "No Data (Ocean/Remote)"
+        # Create Series
+        df = pd.DataFrame({
+            "Date": dates,
+            "Temp": temps,
+            "Precip": precips,
+            "Scenario": scenario_label
+        })
+        
+        # Calculate Aggregates
+        avg_temp = df['Temp'].mean()
+        total_precip = df['Precip'].mean() * 365.25 # Annualized
+        
+        return df, avg_temp, total_precip
+        
+    except Exception as e:
+        st.error(f"Failed to fetch {scenario_label}: {e}")
+        return pd.DataFrame(), 0, 0
 
-# --- 4. MAIN APP ---
+# --- 4. WATER ENGINE (BUFFER SEARCH) ---
+
+def fetch_water_risk(lat, lon):
+    """
+    Uses a spatial buffer (circle) to find intersecting water basins.
+    """
+    # WRI Aqueduct Baseline Water Stress Table
+    table = "wat_050_aqueduct_baseline_water_stress"
+    
+    # Query: Create a buffer of 0.1 degrees (~11km) around the point and find intersection
+    sql = f"""
+        SELECT bws_label, bws_score
+        FROM {table}
+        WHERE ST_Intersects(the_geom, ST_Buffer(ST_SetSRID(ST_Point({lon}, {lat}), 4326), 0.1))
+        LIMIT 1
+    """
+    
+    url = f"https://api.resourcewatch.org/v1/query?sql={sql}"
+    
+    try:
+        r = requests.get(url)
+        data = r.json().get('data', [])
+        if data:
+            return data[0].get('bws_label', 'Unknown')
+        else:
+            return "No Basin Found (Ocean/Remote)"
+    except Exception as e:
+        return f"API Error: {str(e)}"
+
+# --- 5. MAIN EXECUTION ---
 
 if run_btn:
-    with st.spinner("Fetching data..."):
-        # 1. Get Climate
-        c_results = get_climate_data_robust(lat, lon)
+    with st.spinner("Fetching strict climate scenarios..."):
         
-        # 2. Get Water
-        w_stress = get_water_stress_robust(lat, lon)
+        # 1. Fetch Water Risk
+        water_risk = fetch_water_risk(lat, lon)
         
-        # 3. Build Table
-        rows = []
-        for sc, metrics in c_results.items():
-            t_val = metrics['temp']
-            p_val = metrics['precip']
-            
-            # Formatting checks
-            if isinstance(t_val, (int, float)):
-                t_str = f"{t_val:.2f} °C"
-            else:
-                t_str = str(t_val)
-                
-            if isinstance(p_val, (int, float)):
-                p_str = f"{p_val:.0f} mm"
-            else:
-                p_str = str(p_val)
-                
-            rows.append({
-                "Scenario": sc.upper().replace("_", "-"),
-                "Avg Temp (2021-2050)": t_str,
-                "Annual Precip": p_str,
-                "Water Stress (Baseline)": w_stress
-            })
-            
-        st.subheader("Analysis Results")
-        st.table(pd.DataFrame(rows))
+        # 2. Fetch Climate Scenarios (Distinct Calls)
+        # We fetch distinct dataframes to prove they are different
+        df_ssp1, t_ssp1, p_ssp1 = fetch_scenario(lat, lon, "ssp1_2_6", "SSP1-2.6 (Low)")
+        df_ssp2, t_ssp2, p_ssp2 = fetch_scenario(lat, lon, "ssp2_4_5", "SSP2-4.5 (Med)")
+        df_ssp3, t_ssp3, p_ssp3 = fetch_scenario(lat, lon, "ssp3_7_0", "SSP3-7.0 (High)")
         
-        # DEBUG EXPANDER (Hidden by default, open if needed)
-        with st.expander("Show Raw Data Check"):
-            st.json(c_results)
+        # 3. Combine for Charting
+        all_data = pd.concat([df_ssp1, df_ssp2, df_ssp3])
+        
+        # Resample to Annual Average for cleaner charts
+        all_data['Year'] = all_data['Date'].dt.year
+        chart_data = all_data.groupby(['Year', 'Scenario'])[['Temp', 'Precip']].mean().reset_index()
+
+        # --- RESULTS DISPLAY ---
+        
+        st.subheader(f"Results for {lat}, {lon}")
+        
+        # A. Water Risk
+        st.info(f"💧 **Current Water Stress (WRI Aqueduct):** {water_risk}")
+        
+        # B. Summary Table
+        summary_rows = [
+            {"Scenario": "SSP1-2.6 (Low Carbon)", "Avg Temp (2024-2100)": f"{t_ssp1:.2f} °C", "Annual Precip": f"{p_ssp1:.0f} mm"},
+            {"Scenario": "SSP2-4.5 (Middle Road)", "Avg Temp (2024-2100)": f"{t_ssp2:.2f} °C", "Annual Precip": f"{p_ssp2:.0f} mm"},
+            {"Scenario": "SSP3-7.0 (High Carbon)", "Avg Temp (2024-2100)": f"{t_ssp3:.2f} °C", "Annual Precip": f"{p_ssp3:.0f} mm"},
+        ]
+        st.table(pd.DataFrame(summary_rows))
+        
+        # C. Divergence Chart (The Proof)
+        st.subheader("📉 Scenario Divergence (2024–2100)")
+        st.markdown("If the lines separate over time, the API is working correctly.")
+        
+        line_chart = alt.Chart(chart_data).mark_line().encode(
+            x=alt.X('Year', axis=alt.Axis(format='d')),
+            y=alt.Y('Temp', title='Mean Temperature (°C)', scale=alt.Scale(zero=False)),
+            color='Scenario',
+            tooltip=['Year', 'Scenario', 'Temp']
+        ).properties(height=400)
+        
+        st.altair_chart(line_chart, use_container_width=True)
