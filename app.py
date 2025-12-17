@@ -4,10 +4,7 @@ import requests
 # ---------------------------------------------------------
 # 1. CONFIGURATION
 # ---------------------------------------------------------
-# Baseline (Current) ID
 BASELINE_ID = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840"
-
-# Future Projections (Aqueduct 2.1) ID
 FUTURE_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 
 # ---------------------------------------------------------
@@ -19,10 +16,9 @@ def fetch_baseline_risk(lat, lon):
     """
     sql_query = f"SELECT bws_label, bws_score FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     url = f"https://api.resourcewatch.org/v1/query/{BASELINE_ID}"
-    params = {"sql": sql_query}
-
+    
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params={"sql": sql_query})
         if response.status_code == 200:
             data = response.json().get('data', [])
             return data[0] if data else {"error": "No baseline data found."}
@@ -32,20 +28,29 @@ def fetch_baseline_risk(lat, lon):
 
 def fetch_future_risk(lat, lon):
     """
-    Fetches Future Water Stress for 2030 (Business As Usual).
-    Schema: ws (Water Stress) + 30 (2030) + 28 (BAU Scenario)
+    Fetches Future Water Stress for 2030 & 2040 across two scenarios.
+    
+    Schema Decoding:
+    ws = Water Stress
+    Years: 30=2030, 40=2040
+    Scenarios: 24=Optimistic (RCP4.5), 28=BAU (RCP8.5)
+    Suffix: tr=Score, tl=Label
     """
-    # Using 'ws3028tr' (Raw Score) and 'ws3028tl' (Label)
+    # We request all 8 columns in a single query
     sql_query = f"""
-        SELECT ws3028tr as score, ws3028tl as label 
+        SELECT 
+            ws3024tr, ws3024tl, -- 2030 Optimistic
+            ws3028tr, ws3028tl, -- 2030 BAU
+            ws4024tr, ws4024tl, -- 2040 Optimistic
+            ws4028tr, ws4028tl  -- 2040 BAU
         FROM data 
         WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))
     """
+    
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_ID}"
-    params = {"sql": sql_query}
-
+    
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params={"sql": sql_query})
         if response.status_code == 200:
             data = response.json().get('data', [])
             return data[0] if data else {"error": "No future data found."}
@@ -54,29 +59,18 @@ def fetch_future_risk(lat, lon):
         return {"error": str(e)}
 
 def search_wri_datasets(term):
-    """
-    Searches the WRI API for datasets matching a term.
-    """
     url = "https://api.resourcewatch.org/v1/dataset"
-    params = {
-        "name": term,
-        "published": "true",
-        "limit": 10,
-        "includes": "metadata"
-    }
+    params = {"name": term, "published": "true", "limit": 10, "includes": "metadata"}
     try:
         return requests.get(url, params=params).json().get('data', [])
-    except Exception as e:
+    except Exception:
         return []
 
 def inspect_columns(dataset_id):
-    """
-    Fetches one row of data to reveal column names.
-    """
     url = f"https://api.resourcewatch.org/v1/query/{dataset_id}?sql=SELECT * FROM data LIMIT 1"
     try:
         return requests.get(url).json().get('data', [])
-    except Exception as e:
+    except Exception:
         return None
 
 # ---------------------------------------------------------
@@ -85,14 +79,15 @@ def inspect_columns(dataset_id):
 st.set_page_config(page_title="Water Risk App", page_icon="💧", layout="wide")
 st.title("💧 Water Risk Intelligence")
 
-# --- MAIN INPUTS ---
+# Inputs
 col1, col2 = st.columns(2)
 with col1:
     lat_input = st.number_input("Latitude", value=33.4484, format="%.4f")
 with col2:
     lon_input = st.number_input("Longitude", value=-112.0740, format="%.4f")
 
-# --- SECTION 1: BASELINE ---
+# --- 1. BASELINE ---
+st.divider()
 st.subheader("1. Current Baseline")
 if st.button("Check Current Risk"):
     with st.spinner("Analyzing..."):
@@ -102,67 +97,80 @@ if st.button("Check Current Risk"):
     else:
         score = res.get('bws_score', 'N/A')
         label = res.get('bws_label', 'Unknown')
-        st.metric("Current Score", f"{score} / 5")
-        st.info(f"Category: {label}")
+        
+        # Simple color formatting
+        s_val = float(score) if score != 'N/A' else 0
+        if s_val >= 4:
+            st.error(f"Score: {score} ({label})")
+        elif s_val >= 3:
+            st.warning(f"Score: {score} ({label})")
+        else:
+            st.success(f"Score: {score} ({label})")
 
-# --- SECTION 2: FUTURE ---
-st.subheader("2. 2030 Projection (BAU)")
-st.caption("Scenario: SSP2 RCP8.5 (Business as Usual)")
-if st.button("Predict 2030 Risk"):
-    with st.spinner("Projecting..."):
-        res = fetch_future_risk(lat_input, lon_input)
-    if "error" in res:
-        st.warning(res["error"])
+# --- 2. FUTURE PROJECTIONS ---
+st.divider()
+st.subheader("2. Future Projections (2030 & 2040)")
+st.caption("Comparing Optimistic (RCP4.5) vs. Business as Usual (RCP8.5)")
+
+if st.button("Generate Projections"):
+    with st.spinner("Projecting Scenarios..."):
+        f_res = fetch_future_risk(lat_input, lon_input)
+    
+    if "error" in f_res:
+        st.warning(f_res["error"])
     else:
-        f_score = res.get('score', 'N/A')
-        f_label = res.get('label', 'Unknown')
-        st.metric("2030 Projected Score", f"{f_score}")
-        st.info(f"Projected Category: {f_label}")
+        # Create a 2x2 grid for the data
+        # Row 1: 2030
+        st.markdown("### 📅 2030 Projections")
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.write("🌱 **Optimistic (Scenario 24)**")
+            st.metric("Score", f"{f_res.get('ws3024tr')} / 5", delta_color="inverse")
+            st.caption(f"Risk: {f_res.get('ws3024tl')}")
+            
+        with c2:
+            st.write("🏭 **Business as Usual (Scenario 28)**")
+            st.metric("Score", f"{f_res.get('ws3028tr')} / 5", delta_color="inverse")
+            st.caption(f"Risk: {f_res.get('ws3028tl')}")
+
+        st.divider()
+
+        # Row 2: 2040
+        st.markdown("### 📅 2040 Projections")
+        c3, c4 = st.columns(2)
+        
+        with c3:
+            st.write("🌱 **Optimistic (Scenario 24)**")
+            st.metric("Score", f"{f_res.get('ws4024tr')} / 5", delta_color="inverse")
+            st.caption(f"Risk: {f_res.get('ws4024tl')}")
+            
+        with c4:
+            st.write("🏭 **Business as Usual (Scenario 28)**")
+            st.metric("Score", f"{f_res.get('ws4028tr')} / 5", delta_color="inverse")
+            st.caption(f"Risk: {f_res.get('ws4028tl')}")
 
 # ---------------------------------------------------------
-# 4. SIDEBAR (DEVELOPER TOOLS)
+# 4. SIDEBAR TOOLS
 # ---------------------------------------------------------
 st.sidebar.header("🔧 Developer Tools")
-st.sidebar.markdown("---")
-
-# --- TOOL A: DATASET SEARCH ---
-st.sidebar.subheader("🔎 Dataset Finder")
-search_term = st.sidebar.text_input("Search term", value="Water Stress")
+search_query = st.sidebar.text_input("Search Datasets", "Water Stress")
 
 if st.sidebar.button("Search API"):
-    with st.sidebar.status(f"Searching for '{search_term}'..."):
-        results = search_wri_datasets(search_term)
-    
+    results = search_wri_datasets(search_query)
     if results:
         st.sidebar.success(f"Found {len(results)} datasets")
         for ds in results:
-            name = ds['attributes']['name']
-            ds_id = ds['id']
-            with st.sidebar.expander(name):
-                st.code(ds_id)
-                st.caption(f"Provider: {ds['attributes']['provider']}")
+            with st.sidebar.expander(ds['attributes']['name']):
+                st.code(ds['id'])
+                st.json(ds)
     else:
         st.sidebar.warning("No datasets found.")
 
-st.sidebar.markdown("---")
-
-# --- TOOL B: COLUMN INSPECTOR ---
-st.sidebar.subheader("🕵️ Column Inspector")
-inspect_id = st.sidebar.text_input("Paste UUID to inspect", value=FUTURE_ID)
-
-if st.sidebar.button("Get Column Names"):
-    with st.sidebar.status("Fetching table structure..."):
-        rows = inspect_columns(inspect_id)
-    
-    if rows:
-        cols = list(rows[0].keys())
-        st.sidebar.success(f"Found {len(cols)} columns")
-        st.sidebar.write(cols)
-        
-        # Helper: Highlight potential future columns
-        future_cols = [c for c in cols if any(x in c for x in ['20','30','40','50'])]
-        if future_cols:
-            st.sidebar.info("Potential Projection Columns:")
-            st.sidebar.code(future_cols)
-    else:
-        st.sidebar.error("Could not fetch columns. Dataset might be empty or restricted.")
+st.sidebar.divider()
+st.sidebar.subheader("Inspect Columns")
+inspect_id = st.sidebar.text_input("Dataset UUID", value=FUTURE_ID)
+if st.sidebar.button("Get Columns"):
+    cols = inspect_columns(inspect_id)
+    if cols:
+        st.sidebar.write(list(cols[0].keys()))
