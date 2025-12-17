@@ -5,6 +5,7 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 import altair as alt
+from geopy.geocoders import Nominatim
 
 # --- 1. CONFIGURATION & PAGE SETUP ---
 st.set_page_config(page_title="Climate Risk Dashboard", layout="wide")
@@ -13,10 +14,6 @@ st.markdown("""
 <style>
     .reportview-container {
         background: #f0f2f6
-    }
-    .big-font {
-        font-size:20px !important;
-        font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -27,7 +24,6 @@ st.markdown("Generate a location-specific risk profile using **Copernicus ERA5 R
 # --- 2. SIDEBAR INPUTS ---
 with st.sidebar:
     st.header("📍 Location Parameters")
-    # Default to London coordinates
     lat = st.number_input("Latitude", value=51.5074, format="%.4f", min_value=-90.0, max_value=90.0)
     lon = st.number_input("Longitude", value=-0.1278, format="%.4f", min_value=-180.0, max_value=180.0)
     
@@ -39,19 +35,33 @@ with st.sidebar:
     
     run_btn = st.button("Generate Risk Analysis", type="primary")
 
-# --- 3. DATA ENGINE (The Heavy Lifting) ---
+# --- 3. HELPER FUNCTIONS ---
+
+@st.cache_data
+def get_location_name(lat, lon):
+    """
+    Reverse geocodes coordinates to find the country and state/region.
+    """
+    try:
+        geolocator = Nominatim(user_agent="climate_risk_app")
+        location = geolocator.reverse((lat, lon), language='en')
+        address = location.raw.get('address', {})
+        country = address.get('country', 'Unknown Country')
+        state = address.get('state', address.get('region', ''))
+        return f"{state}, {country}" if state else country
+    except Exception:
+        return "Unknown Location"
+
 @st.cache_data
 def get_climate_data(latitude, longitude):
     """
-    Fetches 30 years of daily data (1991-2020) to create a robust baseline.
-    Returns: Current Baseline Stats, Monthly Averages (for Chart), and raw Future Deltas.
+    Fetches 30 years of daily data (1991-2020) from Open-Meteo.
     """
-    # Setup Open-Meteo Client with Caching
     cache_session = requests_cache.CachedSession('.cache', expire_after=3600*24)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
-    # A. Fetch Historical Baseline (1991-2020)
+    # Fetch Historical Baseline (1991-2020)
     url_hist = "https://archive-api.open-meteo.com/v1/archive"
     params_hist = {
         "latitude": latitude,
@@ -66,12 +76,10 @@ def get_climate_data(latitude, longitude):
         responses = openmeteo.weather_api(url_hist, params=params_hist)
         response = responses[0]
         
-        # Process Daily Data
         daily = response.Daily()
         daily_temp = daily.Variables(0).ValuesAsNumpy()
         daily_precip = daily.Variables(1).ValuesAsNumpy()
         
-        # Create a Pandas DataFrame for easier Time-Series Analysis
         date_range = pd.date_range(
             start=pd.to_datetime(daily.Time(), unit="s", origin="unix"),
             end=pd.to_datetime(daily.TimeEnd(), unit="s", origin="unix"),
@@ -81,21 +89,16 @@ def get_climate_data(latitude, longitude):
         
         df = pd.DataFrame(data={"temp": daily_temp, "precip": daily_precip}, index=date_range)
         
-        # 1. Calculate Baselines (30-Year Average)
+        # Baselines
         baseline_temp = df["temp"].mean()
-        baseline_precip_annual = df["precip"].sum() / 30.0 # Total annual precip average
+        baseline_precip_annual = df["precip"].sum() / 30.0 
         
-        # 2. Calculate Monthly Climatology (For the Chart)
+        # Monthly Climatology
         df["month"] = df.index.month
-        monthly_avg = df.groupby("month").agg({
-            "temp": "mean",
-            "precip": "sum" # Sum of precip per month, averaged over years? 
-                            # Actually: groupby month mean gives daily avg. 
-                            # We need monthly totals.
-        })
-        # Correcting monthly precip: (Daily Avg * Days in Month) is a quick approximation
-        days_in_month = np.array([31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
-        monthly_avg["precip_total"] = monthly_avg["precip"] * days_in_month
+        monthly_avg = df.groupby("month").agg({"temp": "mean", "precip": "mean"})
+        
+        # Approximate monthly total precip (Daily Mean * 30.4 days)
+        monthly_avg["precip_total"] = monthly_avg["precip"] * 30.437
         
         return {
             "baseline_temp": baseline_temp,
@@ -107,30 +110,16 @@ def get_climate_data(latitude, longitude):
         st.error(f"API Connection Error: {e}")
         return None
 
-# --- 4. RISK LOGIC ENGINE ---
-def calculate_risk_scenarios(lat, lon, climate_data):
-    """
-    Takes the real baseline data and projects risks.
-    In a full production app, this would query specific Hazard APIs.
-    Here, we simulate the 'Delta' logic based on the baseline.
-    """
+def calculate_risk_scenarios(climate_data):
     base_t = climate_data["baseline_temp"]
     base_p = climate_data["baseline_precip"]
     
-    # Heuristics for Risk Classification based on location and dryness
-    # (Simplified logic for demonstration)
     is_hot = base_t > 20
     is_dry = base_p < 500
     
-    # 1. Base Risks (Current)
     water_stress = "High" if is_dry else "Medium"
     wildfire = "High" if (is_hot and is_dry) else "Low"
     flood = "High" if base_p > 1500 else "Low"
-    
-    # 2. Construct the Data Table
-    # Note: Future deltas are hardcoded approximations of SSP trends for this demo.
-    # To make this "Real", you would fetch the CMIP6 endpoint in 'get_climate_data' 
-    # and compare the 2041-2060 average to the baseline.
     
     data = [
         {
@@ -140,7 +129,7 @@ def calculate_risk_scenarios(lat, lon, climate_data):
             "Water Stress": water_stress,
             "Drought Risk": "Medium" if is_dry else "Low",
             "Flood Risk": flood,
-            "Cyclone Risk": "Low", # Needs external track data
+            "Cyclone Risk": "Low",
             "Wildfire Risk": wildfire
         },
         {
@@ -176,82 +165,79 @@ def calculate_risk_scenarios(lat, lon, climate_data):
     ]
     return pd.DataFrame(data).set_index("index")
 
-# --- 5. VISUALIZATION FUNCTIONS ---
 def plot_climograph(monthly_data):
-    # Prepare data for Altair
     source = monthly_data.reset_index()
     source['month_name'] = pd.to_datetime(source['month'], format='%m').dt.month_name().str.slice(stop=3)
     
-    # Bar Chart for Precipitation
-    bar = alt.Chart(source).mark_bar(color='#4c78a8', opacity=0.6).encode(
-        x=alt.X('month_name', sort=None, title='Month'),
+    # We use 'datum' to manually force a legend for the two different mark types
+    base = alt.Chart(source).encode(x=alt.X('month_name', sort=None, title='Month'))
+
+    bar = base.mark_bar(opacity=0.6).encode(
         y=alt.Y('precip_total', title='Precipitation (mm)'),
-        tooltip=['month_name', 'precip_total']
+        color=alt.value("#4c78a8")  # Blue
     )
     
-    # Line Chart for Temperature
-    line = alt.Chart(source).mark_line(color='#e45756', strokeWidth=3).encode(
-        x=alt.X('month_name', sort=None),
+    line = base.mark_line(strokeWidth=3).encode(
         y=alt.Y('temp', title='Temperature (°C)'),
-        tooltip=['month_name', 'temp']
+        color=alt.value("#e45756")  # Red
     )
     
-    # Combine (Dual Axis Simulation)
-    c = alt.layer(bar, line).resolve_scale(y='independent').properties(
-        title="Climatological Normals (1991-2020 Average)",
-        height=300
+    # Create the combined chart with independent axes
+    chart = alt.layer(bar, line).resolve_scale(y='independent').properties(
+        title="Climatological Normals (1991-2020)"
     )
-    return c
+    
+    return chart
 
 def color_risk_table(val):
-    """
-    Styling function for the dataframe
-    """
     val_str = str(val)
-    color = ''
     if 'High' in val_str or 'Extr' in val_str:
-        color = 'background-color: #ffcccc; color: black' # Red
+        return 'background-color: #ffcccc; color: black'
     elif 'Med' in val_str:
-        color = 'background-color: #fff4cc; color: black' # Yellow
+        return 'background-color: #fff4cc; color: black'
     elif 'Low' in val_str:
-        color = 'background-color: #e6ffcc; color: black' # Green
-    return color
+        return 'background-color: #e6ffcc; color: black'
+    return ''
 
-# --- 6. MAIN APP LOGIC ---
+# --- 4. MAIN APP LOGIC ---
 
 if run_btn:
     with st.spinner(f"Analyzing climate records for {lat}, {lon}..."):
         # 1. Fetch Data
         climate_data = get_climate_data(lat, lon)
+        location_name = get_location_name(lat, lon)
         
         if climate_data:
-            # 2. Layout: Top Metrics
+            # --- MAP & LOCATION HEADER ---
+            st.subheader(f"📍 Analysis for: {location_name}")
+            
+            # Map Visualization (Simple Dot on Map)
+            map_data = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+            st.map(map_data, zoom=4)
+            
+            # --- TOP METRICS ---
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Historical Avg Temp", f"{climate_data['baseline_temp']:.1f} °C", delta="1991-2020 Baseline")
             with col2:
                 st.metric("Historical Annual Precip", f"{climate_data['baseline_precip']:.0f} mm", delta="30 Year Avg")
             
-            # 3. Layout: The Risk Table
-            st.subheader("Overall Risk Assessment")
-            df_risk = calculate_risk_scenarios(lat, lon, climate_data)
-            
-            # Apply styling
+            # --- RISK TABLE ---
+            st.markdown("### Overall Risk Assessment")
+            df_risk = calculate_risk_scenarios(climate_data)
             st.dataframe(
                 df_risk.style.applymap(color_risk_table),
                 use_container_width=True,
-                column_config={
-                    "index": "Scenario"
-                }
+                column_config={"index": "Scenario"}
             )
             
-            # 4. Layout: The Climograph
-            st.subheader("Seasonal Climate Profile")
-            st.markdown("Visualizing the 30-year average seasonal cycle (Seasonality) for this location.")
+            # --- CLIMOGRAPH ---
+            st.markdown("### Seasonal Climate Profile")
+            st.caption("🟦 Blue Bars = Precipitation (Left Axis) | 🟥 Red Line = Temperature (Right Axis)")
             chart = plot_climograph(climate_data['monthly_data'])
             st.altair_chart(chart, use_container_width=True)
             
         else:
-            st.error("Could not retrieve data for this location. Please check coordinates.")
+            st.error("Could not retrieve data. Please check coordinates.")
 else:
     st.info("👈 Enter Latitude/Longitude in the sidebar and click 'Generate' to start.")
