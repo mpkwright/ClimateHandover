@@ -34,19 +34,30 @@ def fetch_water_risk(lat, lon):
 
 def search_future_datasets():
     """
-    Searches specifically for 'Aqueduct 4.0 Future' datasets.
+    Searches for 'Aqueduct' datasets and filters for 'projected'.
     """
     url = "https://api.resourcewatch.org/v1/dataset"
+    # 1. Broad search for the Aqueduct family
     params = {
-        "name": "Aqueduct 4.0 Future", 
+        "name": "Aqueduct", 
         "published": "true",
-        "limit": 5,
+        "limit": 100, # Get a larger list to filter through
         "includes": "metadata"
     }
 
     try:
         response = requests.get(url, params=params)
-        return response.json().get('data', [])
+        all_data = response.json().get('data', [])
+        
+        # 2. Filter locally for "projected"
+        filtered_results = []
+        for ds in all_data:
+            name = ds['attributes']['name'].lower()
+            if "projected" in name:
+                filtered_results.append(ds)
+                
+        return filtered_results
+        
     except Exception as e:
         return []
 
@@ -94,8 +105,8 @@ if st.button("Check Risk Level"):
 st.sidebar.header("🔧 Developer Tools")
 st.sidebar.info("Use this to find UUIDs for future projection datasets.")
 
-if st.sidebar.button("Debug: Search Future Datasets"):
-    with st.sidebar.status("Searching API..."):
+if st.sidebar.button("Debug: Search 'Projected' Datasets"):
+    with st.sidebar.status("Searching API for 'Aqueduct' + 'Projected'..."):
         datasets = search_future_datasets()
         
     if datasets:
@@ -104,9 +115,11 @@ if st.sidebar.button("Debug: Search Future Datasets"):
         for ds in datasets:
             name = ds['attributes']['name']
             ds_id = ds['id']
-            # Create an expandable section for each dataset found
+            provider = ds['attributes']['provider']
+            
             with st.sidebar.expander(f"📂 {name}"):
+                st.write(f"**Provider:** {provider}")
                 st.text_input("UUID", ds_id, key=ds_id)
                 st.json(ds) 
     else:
-        st.sidebar.warning("No datasets found.")
+        st.sidebar.warning("No datasets found matching 'Aqueduct' and 'Projected'.")
