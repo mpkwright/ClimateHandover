@@ -17,6 +17,7 @@ FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 # ---------------------------------------------------------
 # 2. BACKEND: WRI API (Hazards)
 # ---------------------------------------------------------
+@st.cache_data(ttl=3600)
 def fetch_wri_current(lat, lon, risk_name):
     config = RISK_CONFIG[risk_name]
     uuid = config['uuid']
@@ -24,7 +25,7 @@ def fetch_wri_current(lat, lon, risk_name):
     sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     url = f"https://api.resourcewatch.org/v1/query/{uuid}"
     try:
-        r = requests.get(url, params={"sql": sql}, timeout=10)
+        r = requests.get(url, params={"sql": sql}, timeout=5)
         if r.status_code == 200:
             data = r.json().get('data', [])
             if data: return data[0].get(l_col, "N/A")
@@ -32,11 +33,12 @@ def fetch_wri_current(lat, lon, risk_name):
     except:
         return "N/A"
 
+@st.cache_data(ttl=3600)
 def fetch_wri_future(lat, lon):
     sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
     try:
-        r = requests.get(url, params={"sql": sql}, timeout=10)
+        r = requests.get(url, params={"sql": sql}, timeout=5)
         if r.status_code == 200:
             data = r.json().get('data', [])
             if data:
@@ -62,64 +64,75 @@ def fetch_wri_future(lat, lon):
         return {}
 
 # ---------------------------------------------------------
-# 3. BACKEND: OPEN-METEO (Climate) - FIXED
+# 3. BACKEND: OPEN-METEO (Climate)
 # ---------------------------------------------------------
+@st.cache_data(ttl=86400)
 def fetch_climate_projections(lat, lon):
-    """
-    Fetch CMIP6 Climate Data.
-    BACK TO BASICS: Uses the correct Capitalized Model Names and prints errors if it fails.
-    """
     url = "https://climate-api.open-meteo.com/v1/climate"
-    
-    # These are the Exact Valid Model Names (Case Sensitive)
-    # Reverting to the list that worked previously
-    models = ["CMCC_CM2_VHR4", "FGOALS_f3_H", "MRI_AGCM3_2_S", "EC_Earth3P_HR", "MPI_ESM1_2_XR"]
+    models = ["ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"]
     
     params = {
-        "latitude": lat, 
-        "longitude": lon,
-        "start_date": "1950-01-01", 
-        "end_date": "2050-12-31",
+        "latitude": lat, "longitude": lon,
+        "start_date": "1950-01-01", "end_date": "2050-12-31",
         "models": models,
         "daily": ["temperature_2m_mean", "precipitation_sum"],
         "disable_downscaling": "false"
     }
     
-    # REMOVED the broad try/except so we can see the actual error if it fails
-    response = requests.get(url, params=params, timeout=25) 
-    
-    if response.status_code != 200:
-        st.error(f"Open-Meteo Error {response.status_code}: {response.text}")
-        return None
+    try:
+        response = requests.get(url, params=params, timeout=25)
         
-    data = response.json()
-    if "daily" not in data:
-        st.error("API returned data but no 'daily' key found.")
+        # --- SAFETY: IF 429 LIMIT HIT, RETURN MOCK DATA ---
+        if response.status_code == 429:
+            return generate_mock_climate_data()
+            
+        if response.status_code != 200:
+            st.error(f"Open-Meteo Error {response.status_code}")
+            return None
+        
+        data = response.json()
+        if "daily" not in data: return None
+        
+        daily = data["daily"]
+        time = pd.to_datetime(daily["time"])
+        df = pd.DataFrame(daily)
+        df["time"] = time
+        df.set_index("time", inplace=True)
+        
+        temp_cols = [c for c in df.columns if "temperature" in c]
+        precip_cols = [c for c in df.columns if "precipitation" in c]
+        
+        # Ensemble Mean
+        df["Temp_Daily_Avg"] = df[temp_cols].mean(axis=1)
+        df["Precip_Daily_Avg"] = df[precip_cols].mean(axis=1)
+        
+        # Resample to Annual
+        annual = pd.DataFrame()
+        annual["Temp_Mean"] = df["Temp_Daily_Avg"].resample("Y").mean()
+        annual["Precip_Mean"] = df["Precip_Daily_Avg"].resample("Y").sum()
+        
+        # Mark as REAL data
+        annual.attrs['is_mock'] = False 
+        
+        return annual
+        
+    except Exception as e:
+        st.error(f"API Failed: {e}")
         return None
+
+def generate_mock_climate_data():
+    """Generates fake data but FLAGS it so the UI knows."""
+    dates = pd.date_range(start="1950-01-01", end="2050-12-31", freq="Y")
+    df = pd.DataFrame(index=dates)
     
-    daily = data["daily"]
-    time = pd.to_datetime(daily["time"])
+    # Random placeholder numbers
+    df["Temp_Mean"] = np.linspace(15, 18, len(dates))
+    df["Precip_Mean"] = np.random.normal(200, 10, len(dates))
     
-    df = pd.DataFrame(daily)
-    df["time"] = time
-    df.set_index("time", inplace=True)
+    # CRITICAL: Mark this dataframe as fake using Pandas attributes
+    df.attrs['is_mock'] = True
     
-    # Identify columns
-    temp_cols = [c for c in df.columns if "temperature" in c]
-    precip_cols = [c for c in df.columns if "precipitation" in c]
-    
-    # 1. Average Daily Values across all models (Ensemble Mean)
-    df["Temp_Daily_Avg"] = df[temp_cols].mean(axis=1)
-    df["Precip_Daily_Avg"] = df[precip_cols].mean(axis=1)
-    
-    # 2. Resample to Annual
-    # Temp: Annual Average of daily averages
-    # Precip: Annual Sum of daily averages
-    annual = pd.DataFrame()
-    annual["Temp_Mean"] = df["Temp_Daily_Avg"].resample("Y").mean()
-    annual["Precip_Mean"] = df["Precip_Daily_Avg"].resample("Y").sum()
-    
-    return annual
+    return df
 
 # ---------------------------------------------------------
 # 4. FRONTEND UI
@@ -164,20 +177,30 @@ if st.button("Generate Full Risk Report"):
     }
     
     if clim_df is not None:
+        # CHECK: Is this data fake?
+        is_mock = clim_df.attrs.get('is_mock', False)
+        
+        # If fake, show a giant error banner
+        if is_mock:
+            st.error("🚨 API LIMIT REACHED: The Climate Data below is SIMULATED/FAKE. Do not use for analysis.")
+            suffix = " (SIMULATED)"
+        else:
+            suffix = ""
+
         base = clim_df.loc["1990":"2020"]
         scenarios["Current (Baseline)"] = {
-            "Temp": f"{base['Temp_Mean'].mean():.1f}°C",
-            "Precip": f"{base['Precip_Mean'].mean():.0f} mm"
+            "Temp": f"{base['Temp_Mean'].mean():.1f}°C{suffix}",
+            "Precip": f"{base['Precip_Mean'].mean():.0f} mm{suffix}"
         }
         
         def get_clim(year, col, unit="°C", is_sum=False):
             try:
                 start, end = str(year-2), str(year+2)
                 val = clim_df.loc[start:end][col].mean()
-                return f"{val:.0f} {unit}" if is_sum else f"{val:.1f}{unit}"
+                # Append the suffix (SIMULATED) to every single value
+                return f"{val:.0f} {unit}{suffix}" if is_sum else f"{val:.1f}{unit}{suffix}"
             except: return "N/A"
 
-        # Populating both columns with the Ensemble Mean
         for year, label in [(2035, "+10Y"), (2045, "+20Y"), (2050, "+30Y")]:
             t_val = get_clim(year, "Temp_Mean")
             p_val = get_clim(year, "Precip_Mean", "mm", True)
