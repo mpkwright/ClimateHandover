@@ -23,7 +23,7 @@ def fetch_wri_current(lat, lon, risk_name):
     uuid = config['uuid']
     s_col, l_col = config['cols']
     
-    # STRICT Single-line query that we know works
+    # Strict single-line query
     sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{uuid}"
@@ -39,9 +39,9 @@ def fetch_wri_current(lat, lon, risk_name):
 def fetch_wri_future(lat, lon):
     """
     Fetch Future Water Stress (2030 & 2040).
-    Reverted to strict ST_Intersects with simple string formatting.
+    Uses strict single-line SQL to ensure API acceptance.
     """
-    # STRICT Single-line query. No newlines, no comments.
+    # Query 8 columns: 4 Scenarios * (Score + Label)
     sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
@@ -87,56 +87,55 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     """
     Fetch CMIP6 Climate Data (1950-2050).
-    Uses Standard Reliable Models (EC-Earth3 etc) to avoid timeouts.
+    FIX: Aggregates to Annual Data PER MODEL first.
     """
     url = "https://climate-api.open-meteo.com/v1/climate"
     
-    # Safe, standard models that don't timeout
-    safe_models = [
-        "ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"
-    ]
-    
+    # Use standard reliable models to prevent timeouts
     params = {
         "latitude": lat, "longitude": lon,
         "start_date": "1950-01-01", "end_date": "2050-12-31",
-        "models": safe_models,
+        "models": ["ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"],
         "daily": ["temperature_2m_mean", "precipitation_sum"],
         "disable_downscaling": "false"
     }
     
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=15)
         data = r.json()
-        
         if "daily" not in data: return None
         
         daily = data["daily"]
         time = pd.to_datetime(daily["time"])
         
+        # 1. Load Raw Data
         df_raw = pd.DataFrame(daily)
         df_raw["time"] = time
         df_raw.set_index("time", inplace=True)
         
-        # Identify columns
+        # 2. Identify Columns
         temp_cols = [c for c in df_raw.columns if "temperature" in c]
         precip_cols = [c for c in df_raw.columns if "precipitation" in c]
         
-        # Resample to ANNUAL Frequency PER MODEL FIRST (Fixes math error)
-        annual_temp = df_raw[temp_cols].resample("Y").mean()
-        annual_precip = df_raw[precip_cols].resample("Y").sum()
+        # 3. CRITICAL FIX: Annualize PER MODEL first
+        # We calculate the average/sum for each model separately, THEN compare them.
+        annual_temp_models = df_raw[temp_cols].resample("Y").mean()
+        annual_precip_models = df_raw[precip_cols].resample("Y").sum()
         
-        # Calculate Scenarios
-        df_out = pd.DataFrame(index=annual_temp.index)
+        # 4. Calculate Scenarios (Ensemble Spread)
+        df_out = pd.DataFrame(index=annual_temp_models.index)
         
-        # Optimistic (Min) & BAU (Max)
-        df_out["Temp_Opt"] = annual_temp.min(axis=1)
-        df_out["Precip_Opt"] = annual_precip.min(axis=1)
+        # Optimistic Proxy = Min Model (Coolest/Driest valid model year)
+        df_out["Temp_Opt"] = annual_temp_models.min(axis=1)
+        df_out["Precip_Opt"] = annual_precip_models.min(axis=1)
         
-        df_out["Temp_BAU"] = annual_temp.max(axis=1)
-        df_out["Precip_BAU"] = annual_precip.max(axis=1)
+        # BAU Proxy = Max Model (Warmest/Wettest valid model year)
+        df_out["Temp_BAU"] = annual_temp_models.max(axis=1)
+        df_out["Precip_BAU"] = annual_precip_models.max(axis=1)
         
-        df_out["Temp_Mean"] = annual_temp.mean(axis=1)
-        df_out["Precip_Mean"] = annual_precip.mean(axis=1)
+        # Mean
+        df_out["Temp_Mean"] = annual_temp_models.mean(axis=1)
+        df_out["Precip_Mean"] = annual_precip_models.mean(axis=1)
         
         return df_out
         
@@ -197,6 +196,7 @@ if st.button("Generate Full Risk Report"):
         
         def get_clim(year, col, unit="°C", is_sum=False):
             try:
+                # 5-year average window around target year
                 start, end = str(year-2), str(year+2)
                 val = clim_df.loc[start:end][col].mean()
                 return f"{val:.0f} {unit}" if is_sum else f"{val:.1f}{unit}"
