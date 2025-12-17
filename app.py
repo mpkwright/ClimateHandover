@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
+import time
 
 # ---------------------------------------------------------
 # 1. CONFIGURATION & UUIDs
@@ -70,7 +71,6 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     url = "https://climate-api.open-meteo.com/v1/climate"
     models = ["ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"]
-    
     params = {
         "latitude": lat, "longitude": lon,
         "start_date": "1950-01-01", "end_date": "2050-12-31",
@@ -78,17 +78,10 @@ def fetch_climate_projections(lat, lon):
         "daily": ["temperature_2m_mean", "precipitation_sum"],
         "disable_downscaling": "false"
     }
-    
     try:
         response = requests.get(url, params=params, timeout=25)
-        
-        # --- SAFETY: IF 429 LIMIT HIT, RETURN MOCK DATA ---
-        if response.status_code == 429:
-            return generate_mock_climate_data()
-            
-        if response.status_code != 200:
-            st.error(f"Open-Meteo Error {response.status_code}")
-            return None
+        if response.status_code == 429: return generate_mock_climate_data()
+        if response.status_code != 200: return None
         
         data = response.json()
         if "daily" not in data: return None
@@ -106,143 +99,176 @@ def fetch_climate_projections(lat, lon):
         df["Temp_Daily_Avg"] = df[temp_cols].mean(axis=1)
         df["Precip_Daily_Avg"] = df[precip_cols].mean(axis=1)
         
-        # Resample to Annual
         annual = pd.DataFrame()
         annual["Temp_Mean"] = df["Temp_Daily_Avg"].resample("Y").mean()
         annual["Precip_Mean"] = df["Precip_Daily_Avg"].resample("Y").sum()
-        
-        # Mark as REAL data
         annual.attrs['is_mock'] = False 
-        
         return annual
-        
-    except Exception as e:
-        st.error(f"API Failed: {e}")
+    except:
         return None
 
 def generate_mock_climate_data():
-    """Generates fake data but FLAGS it so the UI knows."""
     dates = pd.date_range(start="1950-01-01", end="2050-12-31", freq="Y")
     df = pd.DataFrame(index=dates)
-    
-    # Random placeholder numbers
     df["Temp_Mean"] = np.linspace(15, 18, len(dates))
     df["Precip_Mean"] = np.random.normal(200, 10, len(dates))
-    
-    # CRITICAL: Mark this dataframe as fake using Pandas attributes
     df.attrs['is_mock'] = True
-    
     return df
 
 # ---------------------------------------------------------
-# 4. FRONTEND UI
+# 4. HELPER: BATCH PROCESSOR
 # ---------------------------------------------------------
-st.set_page_config(page_title="Integrated Risk Report", page_icon="🌍", layout="wide")
-
-st.title("🌍 Integrated Climate Risk Assessment")
-
-col_in1, col_in2 = st.columns(2)
-with col_in1:
-    lat = st.number_input("Latitude", 33.4484, format="%.4f")
-with col_in2:
-    lon = st.number_input("Longitude", -112.0740, format="%.4f")
-
-map_df = pd.DataFrame({'lat': [lat], 'lon': [lon]})
-st.map(map_df, zoom=8)
-
-if st.button("Generate Full Risk Report"):
-    progress = st.progress(0)
-    
+def analyze_single_location(lat, lon):
+    """Runs all fetchers for a single point and returns a flat dictionary row."""
     # 1. Hazards
-    drought = fetch_wri_current(lat, lon, "Drought Risk")
-    river = fetch_wri_current(lat, lon, "Riverine Flood")
-    coastal = fetch_wri_current(lat, lon, "Coastal Flood")
-    bws = fetch_wri_current(lat, lon, "Baseline Water Stress")
-    progress.progress(30)
-    
-    # 2. Future Water
-    wri_future = fetch_wri_future(lat, lon)
-    progress.progress(60)
-    
-    # 3. Climate
-    clim_df = fetch_climate_projections(lat, lon)
-    progress.progress(90)
-    
-    # 4. Process Data
-    scenarios = {
-        "Current (Baseline)": {},
-        "+10Y (Optimistic)": {}, "+10Y (BAU)": {},
-        "+20Y (Optimistic)": {}, "+20Y (BAU)": {},
-        "+30Y (Optimistic)": {}, "+30Y (BAU)": {},
+    row = {
+        "Latitude": lat, "Longitude": lon,
+        "Drought Risk": fetch_wri_current(lat, lon, "Drought Risk"),
+        "Riverine Flood": fetch_wri_current(lat, lon, "Riverine Flood"),
+        "Coastal Flood": fetch_wri_current(lat, lon, "Coastal Flood"),
+        "Baseline Water Stress": fetch_wri_current(lat, lon, "Baseline Water Stress")
     }
     
-    if clim_df is not None:
-        # CHECK: Is this data fake?
-        is_mock = clim_df.attrs.get('is_mock', False)
-        
-        # If fake, show a giant error banner
-        if is_mock:
-            st.error("🚨 API LIMIT REACHED: The Climate Data below is SIMULATED/FAKE. Do not use for analysis.")
-            suffix = " (SIMULATED)"
-        else:
-            suffix = ""
+    # 2. Future Water
+    fw = fetch_wri_future(lat, lon)
+    row["WS_2030_Opt"] = fw.get("ws3024tl", "N/A")
+    row["WS_2030_BAU"] = fw.get("ws3028tl", "N/A")
+    row["WS_2040_Opt"] = fw.get("ws4024tl", "N/A")
+    row["WS_2040_BAU"] = fw.get("ws4028tl", "N/A")
 
-        base = clim_df.loc["1990":"2020"]
-        scenarios["Current (Baseline)"] = {
-            "Temp": f"{base['Temp_Mean'].mean():.1f}°C{suffix}",
-            "Precip": f"{base['Precip_Mean'].mean():.0f} mm{suffix}"
-        }
+    # 3. Climate
+    clim = fetch_climate_projections(lat, lon)
+    if clim is not None:
+        is_mock = clim.attrs.get('is_mock', False)
+        suffix = " (SIM)" if is_mock else ""
         
-        def get_clim(year, col, unit="°C", is_sum=False):
+        # Baseline
+        base = clim.loc["1990":"2020"]
+        row["Temp_Baseline"] = f"{base['Temp_Mean'].mean():.1f}C{suffix}"
+        row["Precip_Baseline"] = f"{base['Precip_Mean'].mean():.0f}mm{suffix}"
+        
+        def get_c(y, col, is_s=False):
             try:
-                start, end = str(year-2), str(year+2)
-                val = clim_df.loc[start:end][col].mean()
-                # Append the suffix (SIMULATED) to every single value
-                return f"{val:.0f} {unit}{suffix}" if is_sum else f"{val:.1f}{unit}{suffix}"
+                s, e = str(y-2), str(y+2)
+                v = clim.loc[s:e][col].mean()
+                return f"{v:.0f}mm{suffix}" if is_s else f"{v:.1f}C{suffix}"
             except: return "N/A"
 
-        for year, label in [(2035, "+10Y"), (2045, "+20Y"), (2050, "+30Y")]:
-            t_val = get_clim(year, "Temp_Mean")
-            p_val = get_clim(year, "Precip_Mean", "mm", True)
+        # Projections
+        for y in [2035, 2045, 2050]:
+            row[f"Temp_{y}"] = get_c(y, "Temp_Mean")
+            row[f"Precip_{y}"] = get_c(y, "Precip_Mean", True)
+    else:
+        # Fill N/As if climate failed
+        cols = ["Temp_Baseline", "Precip_Baseline"] + [f"{m}_{y}" for y in [2035,2045,2050] for m in ["Temp", "Precip"]]
+        for c in cols: row[c] = "N/A"
             
-            scenarios[f"{label} (Optimistic)"]["Temp"] = t_val
-            scenarios[f"{label} (Optimistic)"]["Precip"] = p_val
-            scenarios[f"{label} (BAU)"]["Temp"] = t_val
-            scenarios[f"{label} (BAU)"]["Precip"] = p_val
+    return row
 
-    # Water Stress
-    scenarios["Current (Baseline)"]["Water Stress"] = bws
-    scenarios["+10Y (Optimistic)"]["Water Stress"] = wri_future.get("ws3024tl", "N/A")
-    scenarios["+10Y (BAU)"]["Water Stress"] = wri_future.get("ws3028tl", "N/A")
-    scenarios["+20Y (Optimistic)"]["Water Stress"] = wri_future.get("ws4024tl", "N/A")
-    scenarios["+20Y (BAU)"]["Water Stress"] = wri_future.get("ws4028tl", "N/A")
-    scenarios["+30Y (Optimistic)"]["Water Stress"] = "N/A (Limit 2040)"
-    scenarios["+30Y (BAU)"]["Water Stress"] = "N/A (Limit 2040)"
+# ---------------------------------------------------------
+# 5. FRONTEND UI
+# ---------------------------------------------------------
+st.set_page_config(page_title="Climate Risk Intelligence", page_icon="🌍", layout="wide")
+st.title("🌍 Integrated Climate Risk Assessment")
 
-    progress.progress(100)
-    
-    st.divider()
-    st.subheader("⚠️ Current Hazard Profile")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Drought Risk", drought)
-    c2.metric("Riverine Flood", river)
-    c3.metric("Coastal Flood", coastal)
-    
-    st.divider()
-    st.subheader("🔮 Projected Trends (Ensemble Mean)")
-    
-    cols_order = [
-        "Current (Baseline)", 
-        "+10Y (Optimistic)", "+10Y (BAU)",
-        "+20Y (Optimistic)", "+20Y (BAU)",
-        "+30Y (Optimistic)", "+30Y (BAU)"
-    ]
-    
-    table_data = []
-    for metric in ["Temp", "Precip", "Water Stress"]:
-        row = {"Metric": metric}
-        for col in cols_order:
-            row[col] = scenarios.get(col, {}).get(metric, "N/A")
-        table_data.append(row)
+tab1, tab2 = st.tabs(["📍 Single Location", "🚀 Batch Processing"])
+
+# --- TAB 1: SINGLE LOCATION ---
+with tab1:
+    col_in1, col_in2 = st.columns(2)
+    with col_in1:
+        lat = st.number_input("Latitude", 33.4484, format="%.4f")
+    with col_in2:
+        lon = st.number_input("Longitude", -112.0740, format="%.4f")
+
+    map_df = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+    st.map(map_df, zoom=8)
+
+    if st.button("Generate Risk Report", key="btn_single"):
+        # (Re-using the logic from previous steps, wrapped concisely)
+        with st.spinner("Analyzing..."):
+            data_row = analyze_single_location(lat, lon)
+            
+        # Display Hazards
+        st.divider()
+        st.subheader("⚠️ Current Hazard Profile")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Drought", data_row["Drought Risk"])
+        c2.metric("Riverine Flood", data_row["Riverine Flood"])
+        c3.metric("Coastal Flood", data_row["Coastal Flood"])
         
-    st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+        # Display Table
+        st.divider()
+        st.subheader("🔮 Projected Trends")
+        
+        # Transform flat row back to table for display
+        table_data = [
+            {"Metric": "Temp", "Current": data_row.get("Temp_Baseline"), 
+             "+10Y (2035)": data_row.get("Temp_2035"), "+20Y (2045)": data_row.get("Temp_2045"), "+30Y (2050)": data_row.get("Temp_2050")},
+             
+            {"Metric": "Precip", "Current": data_row.get("Precip_Baseline"), 
+             "+10Y (2035)": data_row.get("Precip_2035"), "+20Y (2045)": data_row.get("Precip_2045"), "+30Y (2050)": data_row.get("Precip_2050")},
+             
+            {"Metric": "Water Stress (Opt)", "Current": data_row["Baseline Water Stress"],
+             "+10Y (2035)": data_row["WS_2030_Opt"], "+20Y (2045)": data_row["WS_2040_Opt"], "+30Y (2050)": "N/A"},
+             
+            {"Metric": "Water Stress (BAU)", "Current": data_row["Baseline Water Stress"],
+             "+10Y (2035)": data_row["WS_2030_BAU"], "+20Y (2045)": data_row["WS_2040_BAU"], "+30Y (2050)": "N/A"}
+        ]
+        st.dataframe(pd.DataFrame(table_data), use_container_width=True)
+
+# --- TAB 2: BATCH PROCESSING ---
+with tab2:
+    st.markdown("### 📥 Bulk Analysis")
+    st.info("Upload a CSV file with columns named `latitude` and `longitude`.")
+    
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+    
+    if uploaded_file:
+        df_input = pd.read_csv(uploaded_file)
+        
+        # Validate columns
+        required_cols = {'latitude', 'longitude'}
+        if not required_cols.issubset(df_input.columns.str.lower()):
+            st.error(f"CSV must contain 'latitude' and 'longitude' columns. Found: {list(df_input.columns)}")
+        else:
+            # Normalize column names
+            df_input.columns = df_input.columns.str.lower()
+            
+            if st.button("Run Batch Analysis"):
+                results = []
+                progress_bar = st.progress(0)
+                total_rows = len(df_input)
+                
+                status_text = st.empty()
+                
+                for index, row in df_input.iterrows():
+                    # Update UI
+                    status_text.text(f"Processing row {index + 1} of {total_rows}...")
+                    progress_bar.progress((index + 1) / total_rows)
+                    
+                    # Analyze
+                    r_lat, r_lon = row['latitude'], row['longitude']
+                    analysis = analyze_single_location(r_lat, r_lon)
+                    
+                    # Add ID if exists, else Index
+                    if 'id' in row: analysis['ID'] = row['id']
+                    
+                    results.append(analysis)
+                    
+                    # Rate Limit Pause (Politeness)
+                    time.sleep(0.5)
+                
+                # Complete
+                df_results = pd.DataFrame(results)
+                st.success("Analysis Complete!")
+                st.dataframe(df_results)
+                
+                # Download
+                csv = df_results.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="💾 Download Results as CSV",
+                    data=csv,
+                    file_name="climate_risk_results.csv",
+                    mime="text/csv",
+                )
