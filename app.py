@@ -14,7 +14,9 @@ def fetch_baseline_risk(lat, lon):
     """
     Fetches current Baseline Water Stress.
     """
+    # Clean SQL on one line
     sql_query = f"SELECT bws_label, bws_score FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
+    
     url = f"https://api.resourcewatch.org/v1/query/{BASELINE_ID}"
     
     try:
@@ -30,23 +32,22 @@ def fetch_future_risk(lat, lon):
     """
     Fetches Future Water Stress for 2030 & 2040 (Optimistic vs BAU).
     """
-    # FIX: Removed newlines and comments. 
-    # We select all 8 columns in a single, flat string.
+    # FIX: Single line query to avoid API parser errors
+    # Columns: ws(Water Stress) + Year(30/40) + Scenario(24/28) + Type(tr=Score/tl=Label)
     sql_query = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_ID}"
     
     try:
         response = requests.get(url, params={"sql": sql_query})
-        
         if response.status_code == 200:
             data = response.json().get('data', [])
             return data[0] if data else {"error": "No future data found."}
-            
-        return {"error": f"API Error {response.status_code}: {response.text}"}
-        
+        return {"error": f"API Error: {response.text}"}
     except Exception as e:
-        return {"error": str(e)}def search_wri_datasets(term):
+        return {"error": str(e)}
+
+def search_wri_datasets(term):
     url = "https://api.resourcewatch.org/v1/dataset"
     params = {"name": term, "published": "true", "limit": 10, "includes": "metadata"}
     try:
