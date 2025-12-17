@@ -39,9 +39,7 @@ def fetch_wri_current(lat, lon, risk_name):
 def fetch_wri_future(lat, lon):
     """
     Fetch Future Water Stress (2030 & 2040).
-    Uses strict single-line SQL to ensure API acceptance.
     """
-    # Query 8 columns: 4 Scenarios * (Score + Label)
     sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
@@ -54,7 +52,6 @@ def fetch_wri_future(lat, lon):
             if data:
                 row = data[0]
                 
-                # Helper: If Label is missing, use Score to guess risk
                 def get_val(year, scen, row_data):
                     l_key = f"ws{year}{scen}tl"
                     s_key = f"ws{year}{scen}tr"
@@ -87,11 +84,11 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     """
     Fetch CMIP6 Climate Data (1950-2050).
-    FIX: Aggregates to Annual Data PER MODEL first.
+    SIMPLIFIED: Calculates the robust AVERAGE of all models.
     """
     url = "https://climate-api.open-meteo.com/v1/climate"
     
-    # Use standard reliable models to prevent timeouts
+    # Standard Reliable Models
     params = {
         "latitude": lat, "longitude": lon,
         "start_date": "1950-01-01", "end_date": "2050-12-31",
@@ -109,35 +106,27 @@ def fetch_climate_projections(lat, lon):
         time = pd.to_datetime(daily["time"])
         
         # 1. Load Raw Data
-        df_raw = pd.DataFrame(daily)
-        df_raw["time"] = time
-        df_raw.set_index("time", inplace=True)
+        df = pd.DataFrame(daily)
+        df["time"] = time
+        df.set_index("time", inplace=True)
         
         # 2. Identify Columns
-        temp_cols = [c for c in df_raw.columns if "temperature" in c]
-        precip_cols = [c for c in df_raw.columns if "precipitation" in c]
+        temp_cols = [c for c in df.columns if "temperature" in c]
+        precip_cols = [c for c in df.columns if "precipitation" in c]
         
-        # 3. CRITICAL FIX: Annualize PER MODEL first
-        # We calculate the average/sum for each model separately, THEN compare them.
-        annual_temp_models = df_raw[temp_cols].resample("Y").mean()
-        annual_precip_models = df_raw[precip_cols].resample("Y").sum()
+        # 3. Calculate Ensemble Mean (Daily)
+        # We just take the average of all models. This is safe and robust.
+        df["Temp_Mean"] = df[temp_cols].mean(axis=1)
+        df["Precip_Mean"] = df[precip_cols].mean(axis=1)
         
-        # 4. Calculate Scenarios (Ensemble Spread)
-        df_out = pd.DataFrame(index=annual_temp_models.index)
+        # 4. Resample to Annual
+        # Temp = Mean of daily means
+        # Precip = Sum of daily means (Total annual rainfall)
+        annual = pd.DataFrame()
+        annual["Temp_Mean"] = df["Temp_Mean"].resample("Y").mean()
+        annual["Precip_Mean"] = df["Precip_Mean"].resample("Y").sum()
         
-        # Optimistic Proxy = Min Model (Coolest/Driest valid model year)
-        df_out["Temp_Opt"] = annual_temp_models.min(axis=1)
-        df_out["Precip_Opt"] = annual_precip_models.min(axis=1)
-        
-        # BAU Proxy = Max Model (Warmest/Wettest valid model year)
-        df_out["Temp_BAU"] = annual_temp_models.max(axis=1)
-        df_out["Precip_BAU"] = annual_precip_models.max(axis=1)
-        
-        # Mean
-        df_out["Temp_Mean"] = annual_temp_models.mean(axis=1)
-        df_out["Precip_Mean"] = annual_precip_models.mean(axis=1)
-        
-        return df_out
+        return annual
         
     except Exception as e:
         return None
@@ -196,29 +185,31 @@ if st.button("Generate Full Risk Report"):
         
         def get_clim(year, col, unit="°C", is_sum=False):
             try:
-                # 5-year average window around target year
+                # 5-year average window
                 start, end = str(year-2), str(year+2)
                 val = clim_df.loc[start:end][col].mean()
                 return f"{val:.0f} {unit}" if is_sum else f"{val:.1f}{unit}"
             except: return "N/A"
 
+        # NOTE: We populate both scenarios with the Ensemble Mean
+        
         # +10Y (2035)
-        scenarios["+10Y (Optimistic Proxy)"]["Temp"] = get_clim(2035, "Temp_Opt")
-        scenarios["+10Y (Optimistic Proxy)"]["Precip"] = get_clim(2035, "Precip_Opt", "mm", True)
-        scenarios["+10Y (BAU Proxy)"]["Temp"] = get_clim(2035, "Temp_BAU")
-        scenarios["+10Y (BAU Proxy)"]["Precip"] = get_clim(2035, "Precip_BAU", "mm", True)
+        scenarios["+10Y (Optimistic Proxy)"]["Temp"] = get_clim(2035, "Temp_Mean")
+        scenarios["+10Y (Optimistic Proxy)"]["Precip"] = get_clim(2035, "Precip_Mean", "mm", True)
+        scenarios["+10Y (BAU Proxy)"]["Temp"] = get_clim(2035, "Temp_Mean")
+        scenarios["+10Y (BAU Proxy)"]["Precip"] = get_clim(2035, "Precip_Mean", "mm", True)
 
         # +20Y (2045)
-        scenarios["+20Y (Optimistic Proxy)"]["Temp"] = get_clim(2045, "Temp_Opt")
-        scenarios["+20Y (Optimistic Proxy)"]["Precip"] = get_clim(2045, "Precip_Opt", "mm", True)
-        scenarios["+20Y (BAU Proxy)"]["Temp"] = get_clim(2045, "Temp_BAU")
-        scenarios["+20Y (BAU Proxy)"]["Precip"] = get_clim(2045, "Precip_BAU", "mm", True)
+        scenarios["+20Y (Optimistic Proxy)"]["Temp"] = get_clim(2045, "Temp_Mean")
+        scenarios["+20Y (Optimistic Proxy)"]["Precip"] = get_clim(2045, "Precip_Mean", "mm", True)
+        scenarios["+20Y (BAU Proxy)"]["Temp"] = get_clim(2045, "Temp_Mean")
+        scenarios["+20Y (BAU Proxy)"]["Precip"] = get_clim(2045, "Precip_Mean", "mm", True)
         
         # +30Y (2050)
-        scenarios["+30Y (Optimistic Proxy)"]["Temp"] = get_clim(2050, "Temp_Opt")
-        scenarios["+30Y (Optimistic Proxy)"]["Precip"] = get_clim(2050, "Precip_Opt", "mm", True)
-        scenarios["+30Y (BAU Proxy)"]["Temp"] = get_clim(2050, "Temp_BAU")
-        scenarios["+30Y (BAU Proxy)"]["Precip"] = get_clim(2050, "Precip_BAU", "mm", True)
+        scenarios["+30Y (Optimistic Proxy)"]["Temp"] = get_clim(2050, "Temp_Mean")
+        scenarios["+30Y (Optimistic Proxy)"]["Precip"] = get_clim(2050, "Precip_Mean", "mm", True)
+        scenarios["+30Y (BAU Proxy)"]["Temp"] = get_clim(2050, "Temp_Mean")
+        scenarios["+30Y (BAU Proxy)"]["Precip"] = get_clim(2050, "Precip_Mean", "mm", True)
 
     # Water Stress (WRI)
     scenarios["Current (Baseline)"]["Water Stress"] = bws
@@ -241,7 +232,7 @@ if st.button("Generate Full Risk Report"):
     c3.metric("Coastal Flood", coastal)
     
     st.divider()
-    st.subheader("🔮 Projected Trends (Model Ensemble Spread)")
+    st.subheader("🔮 Projected Trends (Ensemble Mean)")
     
     cols_order = [
         "Current (Baseline)", 
