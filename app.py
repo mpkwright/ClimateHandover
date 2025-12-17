@@ -30,11 +30,11 @@ def fetch_baseline_risk(lat, lon):
 
 def fetch_future_risk(lat, lon):
     """
-    Fetches Future Water Stress for 2030 & 2040 (Optimistic vs BAU).
+    Fetches Future Water Stress LABELS only.
+    We fetch the 'tl' (Text Label) columns for 2030 & 2040 (Optimistic vs BAU).
     """
-    # FIX: Single line query to avoid API parser errors
-    # Columns: ws(Water Stress) + Year(30/40) + Scenario(24/28) + Type(tr=Score/tl=Label)
-    sql_query = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
+    # Note: We fetch only the labels (tl), ignoring the raw scores (tr)
+    sql_query = f"SELECT ws3024tl, ws3028tl, ws4024tl, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_ID}"
     
@@ -62,6 +62,24 @@ def inspect_columns(dataset_id):
     except Exception:
         return None
 
+# Helper to color-code risk labels
+def display_risk_label(label):
+    if not label:
+        st.info("No Data")
+        return
+        
+    l = label.lower()
+    if "extremely high" in l:
+        st.error(f"🔥 {label}")
+    elif "high" in l:
+        st.warning(f"⚠️ {label}")
+    elif "medium" in l:
+        st.info(f"💧 {label}")
+    elif "low" in l:
+        st.success(f"✅ {label}")
+    else:
+        st.write(f"ℹ️ {label}")
+
 # ---------------------------------------------------------
 # 3. FRONTEND UI
 # ---------------------------------------------------------
@@ -87,18 +105,13 @@ if st.button("Check Current Risk"):
         score = res.get('bws_score', 'N/A')
         label = res.get('bws_label', 'Unknown')
         
-        # Simple color formatting
-        s_val = float(score) if score != 'N/A' else 0
-        if s_val >= 4:
-            st.error(f"Score: {score} ({label})")
-        elif s_val >= 3:
-            st.warning(f"Score: {score} ({label})")
-        else:
-            st.success(f"Score: {score} ({label})")
+        # Display Baseline with Score (since we know this scale is 0-5)
+        st.metric("Baseline Score", f"{score} / 5")
+        display_risk_label(label)
 
 # --- 2. FUTURE PROJECTIONS ---
 st.divider()
-st.subheader("2. Future Projections (2030 & 2040)")
+st.subheader("2. Future Projections (Labels Only)")
 st.caption("Comparing Optimistic (RCP4.5) vs. Business as Usual (RCP8.5)")
 
 if st.button("Generate Projections"):
@@ -108,36 +121,27 @@ if st.button("Generate Projections"):
     if "error" in f_res:
         st.warning(f_res["error"])
     else:
-        # Create a 2x2 grid for the data
         # Row 1: 2030
         st.markdown("### 📅 2030 Projections")
         c1, c2 = st.columns(2)
-        
         with c1:
-            st.write("🌱 **Optimistic (Scenario 24)**")
-            st.metric("Score", f"{f_res.get('ws3024tr')} / 5", delta_color="inverse")
-            st.caption(f"Risk: {f_res.get('ws3024tl')}")
-            
+            st.markdown("**🌱 Optimistic**")
+            display_risk_label(f_res.get('ws3024tl', 'N/A'))
         with c2:
-            st.write("🏭 **Business as Usual (Scenario 28)**")
-            st.metric("Score", f"{f_res.get('ws3028tr')} / 5", delta_color="inverse")
-            st.caption(f"Risk: {f_res.get('ws3028tl')}")
+            st.markdown("**🏭 Business as Usual**")
+            display_risk_label(f_res.get('ws3028tl', 'N/A'))
 
         st.divider()
 
         # Row 2: 2040
         st.markdown("### 📅 2040 Projections")
         c3, c4 = st.columns(2)
-        
         with c3:
-            st.write("🌱 **Optimistic (Scenario 24)**")
-            st.metric("Score", f"{f_res.get('ws4024tr')} / 5", delta_color="inverse")
-            st.caption(f"Risk: {f_res.get('ws4024tl')}")
-            
+            st.markdown("**🌱 Optimistic**")
+            display_risk_label(f_res.get('ws4024tl', 'N/A'))
         with c4:
-            st.write("🏭 **Business as Usual (Scenario 28)**")
-            st.metric("Score", f"{f_res.get('ws4028tr')} / 5", delta_color="inverse")
-            st.caption(f"Risk: {f_res.get('ws4028tl')}")
+            st.markdown("**🏭 Business as Usual**")
+            display_risk_label(f_res.get('ws4028tl', 'N/A'))
 
 # ---------------------------------------------------------
 # 4. SIDEBAR TOOLS
