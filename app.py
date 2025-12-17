@@ -1,56 +1,54 @@
 import requests
 import json
 
-def get_aqueduct_data():
-    # 1. Search for the specific Aqueduct dataset
-    search_url = "https://api.resourcewatch.org/v1/dataset"
-    search_params = {
-        "name": "Aqueduct Baseline Water Stress",
-        "published": "true",
-        "limit": 1,  # We only want the top match
-        "includes": "metadata"
-    }
+# This is the UUID we found for "Aqueduct Baseline Water Stress"
+# We hardcode it so we don't have to search for it every time.
+DATASET_ID = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840"
 
-    print("🔍 Searching for 'Aqueduct Baseline Water Stress'...")
-    
+def get_water_risk(lat, lon):
+    """
+    Fetches the Baseline Water Stress for a specific coordinate.
+    """
+    print(f"🌍 Checking Water Stress at {lat}, {lon}...")
+
+    # WRI allows SQL-like queries. 
+    # ST_Intersects checks if our Point(lon, lat) is inside the dataset's Polygon geometry.
+    # We SELECT only the useful columns (score and label) to keep the output clean.
+    sql_query = f"""
+        SELECT bws_label, bws_score 
+        FROM {DATASET_ID} 
+        WHERE ST_Intersects(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326))
+    """
+
+    url = f"https://api.resourcewatch.org/v1/query/{DATASET_ID}"
+    params = {"sql": sql_query}
+
     try:
-        # SEARCH REQUEST
-        response = requests.get(search_url, params=search_params)
-        response.raise_for_status() # Raises error if 400/500
+        response = requests.get(url, params=params)
         
-        datasets = response.json().get('data', [])
-        if not datasets:
-            print("❌ No dataset found. The API might use a different name.")
-            return
-
-        # Get the ID of the first result
-        target_id = datasets[0]['id']
-        target_name = datasets[0]['attributes']['name']
-        print(f"✅ Found Dataset: {target_name}")
-        print(f"🆔 UUID: {target_id}")
-
-        # 2. Try to fetch actual data (The "API Key" Test)
-        # We ask for just 1 row to test access
-        print("\n🧪 Testing data access (Querying 1 row)...")
-        query_url = f"https://api.resourcewatch.org/v1/query/{target_id}"
-        query_params = {
-            "sql": "SELECT * FROM data LIMIT 1"  # SQL-like query supported by WRI
-        }
-
-        data_response = requests.get(query_url, params=query_params)
-        
-        if data_response.status_code == 200:
-            print("🎉 SUCCESS! Data retrieved without an API key.")
-            print("-" * 30)
-            print(json.dumps(data_response.json(), indent=2))
-        elif data_response.status_code in [401, 403]:
-            print("🔒 ACCESS DENIED. You were right - an API Key is required for data.")
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            
+            if data:
+                # We found a match!
+                result = data[0]
+                print(f"✅ Status: {result.get('bws_label', 'Unknown')}")
+                print(f"📊 Score:  {result.get('bws_score', 'N/A')} / 5")
+            else:
+                print("🤷 No data found for this specific location (might be in the ocean or outside coverage).")
+                
         else:
-            print(f"⚠️ Unexpected Status: {data_response.status_code}")
-            print(data_response.text)
+            print(f"❌ Error: {response.status_code}")
+            print(response.text)
 
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"An error occurred: {e}")
 
 if __name__ == "__main__":
-    get_aqueduct_data()
+    # Test with a location: London, UK (usually Low stress)
+    get_water_risk(51.5074, -0.1278)
+    
+    print("-" * 20)
+    
+    # Test with a location: Phoenix, Arizona (High stress)
+    get_water_risk(33.4484, -112.0740)
