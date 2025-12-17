@@ -4,9 +4,8 @@ import requests
 # ---------------------------------------------------------
 # 1. CONFIGURATION & DATASET MAP
 # ---------------------------------------------------------
-# We group all datasets here for easy management.
-# If a dataset returns "N/A", use the Inspector to find the real column names
-# and update the 'cols' list below.
+# NOTE: If you see "N/A" for any of these, copy the UUID into the
+# Sidebar Inspector to find the real column names, then update 'cols'.
 
 RISK_CONFIG = {
     "Baseline Water Stress": {
@@ -16,22 +15,22 @@ RISK_CONFIG = {
     },
     "Drought Risk": {
         "uuid": "5c9507d1-47f7-4c6a-9e64-fc210ccc48e2",
-        "cols": ["drr_score", "drr_label"], # Guessing 'drr' (Drought Risk Repetition?)
+        "cols": ["drr_score", "drr_label"], # Verify this with Inspector!
         "color": "orange"
     },
     "Riverine Flood Risk": {
         "uuid": "df9ef304-672f-4c17-97f4-f9f8fa2849ff",
-        "cols": ["rfr_score", "rfr_label"], # Guessing 'rfr'
+        "cols": ["rfr_score", "rfr_label"], # Verify this with Inspector!
         "color": "cyan"
     },
     "Coastal Flood Risk": {
         "uuid": "d39919a9-0940-4038-87ac-662f944bc846",
-        "cols": ["cfr_score", "cfr_label"], # Guessing 'cfr'
+        "cols": ["cfr_score", "cfr_label"], # Verify this with Inspector!
         "color": "teal"
     }
 }
 
-# Future Data (Separate Logic)
+# Future Projections (Aqueduct 2.1)
 FUTURE_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 
 # ---------------------------------------------------------
@@ -45,7 +44,7 @@ def fetch_risk_data(lat, lon, dataset_key):
     dataset_id = config['uuid']
     score_col, label_col = config['cols']
     
-    # We fetch both score and label
+    # robust single-line SQL
     sql_query = f"SELECT {score_col}, {label_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{dataset_id}"
@@ -62,6 +61,7 @@ def fetch_risk_data(lat, lon, dataset_key):
 def fetch_future_projections(lat, lon):
     """
     Fetches 2030 & 2040 Future Labels (Optimistic vs BAU).
+    Schema: ws (Water Stress) + Year (30/40) + Scenario (24/28) + tl (Label)
     """
     sql_query = f"SELECT ws3024tl, ws3028tl, ws4024tl, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_ID}"
@@ -75,6 +75,7 @@ def fetch_future_projections(lat, lon):
     except Exception as e:
         return {"error": str(e)}
 
+# --- Sidebar Helper Functions ---
 def search_wri_datasets(term):
     url = "https://api.resourcewatch.org/v1/dataset"
     params = {"name": term, "published": "true", "limit": 10, "includes": "metadata"}
@@ -90,9 +91,10 @@ def inspect_columns(dataset_id):
     except Exception:
         return None
 
+# --- UI Helper ---
 def display_risk_badge(label):
     if not label:
-        st.caption("No Data / Ocean")
+        st.caption("No Data / Safe")
         return
         
     l = str(label).lower()
@@ -127,22 +129,22 @@ st.divider()
 st.subheader("1. Current Climate Hazards")
 
 if st.button("Analyze Current Risks"):
-    with st.spinner("Querying multiple hazard databases..."):
+    with st.spinner("Querying hazard databases..."):
         
-        # Create 4 columns for the 4 datasets
-        cols = st.columns(4)
+        # Dynamic Columns for each hazard
+        cols = st.columns(len(RISK_CONFIG))
         
-        # Loop through our config and fetch data for each
         for idx, (name, config) in enumerate(RISK_CONFIG.items()):
             with cols[idx]:
                 st.markdown(f"**{name}**")
-                
                 res = fetch_risk_data(lat_input, lon_input, name)
                 
                 if "error" in res:
                     st.error("API Error")
+                    with st.expander("Details"):
+                        st.write(res['error'])
                 else:
-                    # Get the specific column names from config
+                    # Parse config columns
                     s_col, l_col = config['cols']
                     
                     score = res.get(s_col, 'N/A')
@@ -166,7 +168,7 @@ if st.button("Predict Future Stress"):
     if "error" in f_res:
         st.warning(f_res["error"])
     else:
-        # Row 1: 2030
+        # 2030 Row
         st.markdown("### 📅 2030")
         c1, c2 = st.columns(2)
         with c1:
@@ -178,7 +180,7 @@ if st.button("Predict Future Stress"):
 
         st.markdown("---")
 
-        # Row 2: 2040
+        # 2040 Row
         st.markdown("### 📅 2040")
         c3, c4 = st.columns(2)
         with c3:
@@ -189,17 +191,45 @@ if st.button("Predict Future Stress"):
             display_risk_badge(f_res.get('ws4028tl'))
 
 # ---------------------------------------------------------
-# 4. SIDEBAR (ESSENTIAL FOR DEBUGGING NEW DATASETS)
+# 4. SIDEBAR (DEVELOPER TOOLS)
 # ---------------------------------------------------------
-st.sidebar.header("🔧 Configuration Tools")
-st.sidebar.info("If new datasets show 'N/A', paste their UUID here to find the correct column names.")
+st.sidebar.header("🔧 Developer Tools")
+st.sidebar.markdown("Use these tools to find new datasets or fix column names.")
+st.sidebar.divider()
 
+# --- TOOL A: DATASET FINDER ---
+st.sidebar.subheader("🔎 Dataset Finder")
+search_term = st.sidebar.text_input("Search term", "Flood")
+
+if st.sidebar.button("Search API"):
+    with st.sidebar.status("Searching..."):
+        results = search_wri_datasets(search_term)
+    
+    if results:
+        st.sidebar.success(f"Found {len(results)} datasets")
+        for ds in results:
+            with st.sidebar.expander(ds['attributes']['name']):
+                st.code(ds['id'])
+                st.caption(f"Provider: {ds['attributes']['provider']}")
+                st.json(ds)
+    else:
+        st.sidebar.warning("No datasets found.")
+
+st.sidebar.divider()
+
+# --- TOOL B: COLUMN INSPECTOR ---
+st.sidebar.subheader("🕵️ Column Inspector")
+st.sidebar.info("Paste a UUID here to see its table structure.")
+
+# Default to Drought Risk so you can check it easily
 inspect_id = st.sidebar.text_input("Dataset UUID", value="5c9507d1-47f7-4c6a-9e64-fc210ccc48e2")
 
 if st.sidebar.button("Inspect Columns"):
-    cols = inspect_columns(inspect_id)
+    with st.sidebar.status("Fetching one row..."):
+        cols = inspect_columns(inspect_id)
+    
     if cols:
         st.sidebar.success("Columns found!")
         st.sidebar.write(list(cols[0].keys()))
     else:
-        st.sidebar.error("Could not fetch columns.")
+        st.sidebar.error("Could not fetch data. Dataset might be empty.")
