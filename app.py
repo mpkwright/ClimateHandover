@@ -181,4 +181,41 @@ def calculate_risk_table(data):
 def plot_chart(monthly):
     src = monthly.reset_index()
     src['month_name'] = pd.to_datetime(src['index'], format='%m').dt.month_name().str.slice(stop=3)
-    base = alt.Chart(src).encode(x=
+    base = alt.Chart(src).encode(x=alt.X('month_name', sort=None, title='Month'))
+    bar = base.mark_bar(opacity=0.5, color='#4c78a8').encode(y='precip_total', tooltip='precip_total')
+    line = base.mark_line(color='#e45756', strokeWidth=3).encode(y='temp', tooltip='temp')
+    return alt.layer(bar, line).resolve_scale(y='independent').properties(title="Seasonal Baseline (1991-2020)")
+
+def style_rows(val):
+    s = str(val)
+    if 'High' in s: return 'background-color: #ffcccc; color: black'
+    if 'Med' in s: return 'background-color: #fff4cc; color: black'
+    if 'Low' in s: return 'background-color: #ccffcc; color: black'
+    return ''
+
+# --- 5. MAIN ---
+if run_btn:
+    with st.spinner("Fetching Decadal Projections..."):
+        data = get_climate_data(lat, lon)
+        if data:
+            st.subheader(f"📍 Analysis for: {get_location_name(lat, lon)}")
+            st.map(pd.DataFrame({'lat':[lat], 'lon':[lon]}), zoom=4)
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Baseline Temp", f"{data['baseline_temp']:.1f}°C")
+            c2.metric("Baseline Precip", f"{data['baseline_precip']:.0f}mm")
+            
+            st.markdown("### 🔮 Decadal Risk Pathways")
+            df = calculate_risk_table(data)
+            
+            st.dataframe(
+                df.style.applymap(style_rows), 
+                use_container_width=True,
+                column_order=["Scenario", "Decade", "Temp", "Precip", "Water Stress", "Drought", "Flood", "Wildfire"]
+            )
+            
+            st.altair_chart(plot_chart(data['monthly']), use_container_width=True)
+        else:
+            st.error("Data Unavailable.")
+else:
+    st.info("👈 Enter Latitude/Longitude in the sidebar and click 'Generate' to start.")
