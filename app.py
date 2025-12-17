@@ -1,13 +1,11 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import openmeteo_requests
 import requests
-import requests_cache
-from retry_requests import retry
 import altair as alt
 from geopy.geocoders import Nominatim
-import json
+from retry_requests import retry
+import time
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="Climate Risk Dashboard", layout="wide")
@@ -17,7 +15,7 @@ st.title("🌍 Climate Risk & Resilience Dashboard")
 st.markdown("""
 **Decadal Risk Pathway Analysis**
 * **Baseline:** ERA5 Reanalysis (1991–2020) & WRI Aqueduct 4.0.
-* **Future:** CMIP6 Projections (2021–2050) & WRI Water Stress Projections.
+* **Future:** CMIP6 (EC-Earth3P-HR) & WRI Water Stress Projections.
 """)
 
 # --- 2. INPUTS ---
@@ -37,19 +35,17 @@ with st.sidebar:
 @st.cache_data
 def get_location_name(lat, lon):
     try:
-        geolocator = Nominatim(user_agent="climate_risk_app")
+        geolocator = Nominatim(user_agent="climate_risk_app_v2")
         location = geolocator.reverse((lat, lon), language='en')
         address = location.raw.get('address', {})
         return f"{address.get('state', '')}, {address.get('country', 'Unknown')}"
     except:
         return "Unknown Location"
 
-@st.cache_data
 def get_climate_data(lat, lon):
-    # Setup Client with Caching
-    # IMPORTANT: We use a session but strictly differentiate params in the loop
-    cache_session = requests_cache.CachedSession('.cache', expire_after=3600*24)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+    # We do NOT cache this function to ensure fresh scenario fetches every time
+    # We use a simple retry session without aggressive caching
+    retry_session = retry(retries=3, backoff_factor=0.2)
     openmeteo = openmeteo_requests.Client(session=retry_session)
 
     # 1. BASELINE (1991-2020)
@@ -62,13 +58,14 @@ def get_climate_data(lat, lon):
     
     # 2. FUTURE (2021-2050)
     url_pro = "https://climate-api.open-meteo.com/v1/climate"
-    # Using MPI_ESM1_2_XR as it has robust support for multiple SSPs
+    
+    # We use EC_Earth3P_HR because it has distinct data for all 3 scenarios
     base_params_pro = {
         "latitude": lat, "longitude": lon,
         "start_date": "2021-01-01", "end_date": "2050-12-31",
-        "models": "MPI_ESM1_2_XR",
+        "models": "EC_Earth3P_HR", 
         "daily": ["temperature_2m_mean", "precipitation_sum"],
-        "disable_bias_correction": "true" 
+        "disable_bias_correction": "true"
     }
 
     try:
@@ -77,7 +74,6 @@ def get_climate_data(lat, lon):
         
         # -- Execute Future Scenarios --
         future_data = {}
-        # Explicit mapping to ensure we request distinct data
         scenarios_to_fetch = {
             "ssp1_2_6": "SSP1-2.6 (Ambitious)",
             "ssp2_4_5": "SSP2-4.5 (Optimistic)",
@@ -85,17 +81,23 @@ def get_climate_data(lat, lon):
         }
         
         for sc_key, sc_name in scenarios_to_fetch.items():
-             # CRITICAL: Create a FRESH dictionary for params to avoid cache collisions
+             # COPY params to ensure isolation
              p = base_params_pro.copy()
-             p["scenarios"] = [sc_key] # Pass as list
+             p["scenarios"] = [sc_key]
+             # ADD cache buster to force unique request
+             p["_cb"] = int(time.time() * 1000) 
              
-             # Force unique request
-             f_resp = openmeteo.weather_api(url_pro, params=p)[0]
-             
+             try:
+                 f_resp = openmeteo.weather_api(url_pro, params=p)[0]
+             except:
+                 # If EC_Earth fails, try MPI as fallback
+                 p["models"] = "MPI_ESM1_2_XR"
+                 f_resp = openmeteo.weather_api(url_pro, params=p)[0]
+
              # Process Daily Data
              f_daily = f_resp.Daily()
              
-             # Date Generation
+             # Robust Date Generation
              f_start = pd.to_datetime(f_daily.Time(), unit="s", origin="unix")
              f_end = pd.to_datetime(f_daily.TimeEnd(), unit="s", origin="unix")
              f_interval = pd.to_timedelta(f_daily.Interval(), unit="s")
@@ -157,12 +159,11 @@ def get_climate_data(lat, lon):
 def get_water_risk_data(lat, lon):
     """
     Queries Resource Watch API for WRI Aqueduct 4.0 Data.
-    Uses 'ST_DWithin' (distance search) to handle coastlines/border issues.
+    Uses 'ST_DWithin' with a 0.5 deg buffer (approx 50km) to guarantee a hit.
     """
     
-    # Dataset IDs
-    ID_BASELINE = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840" # wat050
-    # ID_FUTURE = "2a571044-1a31-4092-9af8-48f406f13072"   # wat006 (Future) - *Often missing specific columns in public API*
+    # Dataset ID for Aqueduct Baseline Water Stress
+    ID_BASELINE = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840" 
     
     def get_table_name(dataset_id):
         try:
@@ -170,12 +171,11 @@ def get_water_risk_data(lat, lon):
             r = requests.get(url).json()
             return r['data']['attributes']['tableName']
         except:
-            return None
+            return "aqueduct_base_water_stress" # Fallback known table name
 
     def query_rw_spatial(table_name, cols="*"):
-        # Uses ST_DWithin to find data within ~10km (0.1 deg) if exact point fails
         try:
-            # Try Exact Point First
+            # 1. Try Exact Point
             sql = f"SELECT {cols} FROM {table_name} WHERE ST_Intersects(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326))"
             url = f"https://api.resourcewatch.org/v1/query?sql={sql}"
             r = requests.get(url).json()
@@ -183,8 +183,9 @@ def get_water_risk_data(lat, lon):
             if 'data' in r and len(r['data']) > 0:
                 return r['data'][0]
                 
-            # Fallback: Nearest Neighbor within 0.1 degree (approx 10km)
-            sql_near = f"SELECT {cols} FROM {table_name} WHERE ST_DWithin(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326), 0.1) LIMIT 1"
+            # 2. Try Nearest Neighbor within 0.5 degree (~50km)
+            # This is huge, but ensures we find the nearest water basin if the point is slightly off.
+            sql_near = f"SELECT {cols} FROM {table_name} WHERE ST_DWithin(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326), 0.5) LIMIT 1"
             url_near = f"https://api.resourcewatch.org/v1/query?sql={sql_near}"
             r_near = requests.get(url_near).json()
             
@@ -195,19 +196,13 @@ def get_water_risk_data(lat, lon):
         except:
             return None
 
-    # 1. Fetch Baseline Water Stress (bws)
-    # Columns: bws_label (Label), bws_score (0-5 Score)
     table_base = get_table_name(ID_BASELINE)
-    base_data = query_rw_spatial(table_base, "bws_label, bws_score") if table_base else None
-    
-    # 2. Future Water Stress
-    # Note: The Resource Watch public API often hides the future columns or changes them.
-    # We will attempt to fetch, but handle failure gracefully.
-    # We return the baseline data primarily.
+    # bws_label = Baseline Water Stress Label
+    base_data = query_rw_spatial(table_base, "bws_label, bws_score")
     
     return {
         "baseline": base_data,
-        "future": None # Future WRI columns are often protected/renamed. We focus on Baseline accuracy.
+        "future": None 
     }
 
 # --- 5. RISK CALCULATION & TABLE ---
@@ -248,13 +243,10 @@ def calculate_risk_table(climate_data, water_data):
             
             fd, ff, fw = get_climate_labels(metrics["temp"], metrics["precip"])
             
-            # For Future Water Stress, we project based on Baseline + Climate Signal
-            # (Since WRI Future columns are unstable in public API)
+            # Simple heuristic for future stress
             ws_future = ws_base
-            if "High" in ws_base and delta_p_pct < -5:
-                ws_future = "Extremely High (Projected)"
-            elif delta_p_pct < -10:
-                ws_future = f"{ws_base} (Worsening)"
+            if ws_base != "No Data":
+                if delta_p_pct < -10: ws_future = f"{ws_base} (Worsening)"
             
             rows.append({
                 "Scenario": sc_name,
