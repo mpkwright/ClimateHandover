@@ -1,235 +1,264 @@
 import streamlit as st
 import requests
+import pandas as pd
+import numpy as np
 
 # ---------------------------------------------------------
-# 1. CONFIGURATION & DATASET MAP
+# 1. CONFIGURATION & UUIDs
 # ---------------------------------------------------------
-# NOTE: If you see "N/A" for any of these, copy the UUID into the
-# Sidebar Inspector to find the real column names, then update 'cols'.
-
+# WRI Aqueduct Dataset IDs
 RISK_CONFIG = {
-    "Baseline Water Stress": {
-        "uuid": "c66d7f3a-d1a8-488f-af8b-302b0f2c3840",
-        "cols": ["bws_score", "bws_label"], 
-        "color": "blue"
-    },
-    "Drought Risk": {
-        "uuid": "5c9507d1-47f7-4c6a-9e64-fc210ccc48e2",
-        "cols": ["drr_score", "drr_label"], # Verify this with Inspector!
-        "color": "orange"
-    },
-    "Riverine Flood Risk": {
-        "uuid": "df9ef304-672f-4c17-97f4-f9f8fa2849ff",
-        "cols": ["rfr_score", "rfr_label"], # Verify this with Inspector!
-        "color": "cyan"
-    },
-    "Coastal Flood Risk": {
-        "uuid": "d39919a9-0940-4038-87ac-662f944bc846",
-        "cols": ["cfr_score", "cfr_label"], # Verify this with Inspector!
-        "color": "teal"
-    }
+    "Baseline Water Stress": {"uuid": "c66d7f3a-d1a8-488f-af8b-302b0f2c3840", "cols": ["bws_score", "bws_label"]},
+    "Drought Risk":          {"uuid": "5c9507d1-47f7-4c6a-9e64-fc210ccc48e2", "cols": ["drr_score", "drr_label"]},
+    "Riverine Flood":        {"uuid": "df9ef304-672f-4c17-97f4-f9f8fa2849ff", "cols": ["rfr_score", "rfr_label"]},
+    "Coastal Flood":         {"uuid": "d39919a9-0940-4038-87ac-662f944bc846", "cols": ["cfr_score", "cfr_label"]}
 }
-
-# Future Projections (Aqueduct 2.1)
-FUTURE_ID = "2a571044-1a31-4092-9af8-48f406f13072"
+FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 
 # ---------------------------------------------------------
-# 2. BACKEND LOGIC
+# 2. BACKEND: WRI API (Hazards)
 # ---------------------------------------------------------
-def fetch_risk_data(lat, lon, dataset_key):
-    """
-    Generic fetcher for any risk dataset defined in RISK_CONFIG.
-    """
-    config = RISK_CONFIG[dataset_key]
-    dataset_id = config['uuid']
-    score_col, label_col = config['cols']
+def fetch_wri_current(lat, lon, risk_name):
+    """Fetch current risk scores for a specific hazard."""
+    config = RISK_CONFIG[risk_name]
+    uuid = config['uuid']
+    s_col, l_col = config['cols']
     
-    # robust single-line SQL
-    sql_query = f"SELECT {score_col}, {label_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    
-    url = f"https://api.resourcewatch.org/v1/query/{dataset_id}"
+    sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
+    url = f"https://api.resourcewatch.org/v1/query/{uuid}"
     
     try:
-        response = requests.get(url, params={"sql": sql_query})
-        if response.status_code == 200:
-            data = response.json().get('data', [])
-            return data[0] if data else {}
-        return {"error": f"API Error: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
+        r = requests.get(url, params={"sql": sql}, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            if data:
+                return data[0].get(l_col, "N/A")
+        return "N/A"
+    except:
+        return "N/A"
 
-def fetch_future_projections(lat, lon):
+def fetch_wri_future(lat, lon):
     """
-    Fetches 2030 & 2040 Future Labels (Optimistic vs BAU).
-    Schema: ws (Water Stress) + Year (30/40) + Scenario (24/28) + tl (Label)
+    Fetch Future Water Stress for 2030 & 2040.
+    Scenarios: 24 (Optimistic/RCP4.5), 28 (BAU/RCP8.5)
     """
-    sql_query = f"SELECT ws3024tl, ws3028tl, ws4024tl, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    url = f"https://api.resourcewatch.org/v1/query/{FUTURE_ID}"
+    # ws = Water Stress, 30=2030, 40=2040, tl=Label
+    sql = "SELECT ws3024tl, ws3028tl, ws4024tl, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
+    url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
     
     try:
-        response = requests.get(url, params={"sql": sql_query})
-        if response.status_code == 200:
-            data = response.json().get('data', [])
-            return data[0] if data else {}
-        return {"error": f"API Error: {response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
+        r = requests.get(url, params={"sql": sql}, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            if data:
+                return data[0]
+        return {}
+    except:
+        return {}
 
-# --- Sidebar Helper Functions ---
-def search_wri_datasets(term):
-    url = "https://api.resourcewatch.org/v1/dataset"
-    params = {"name": term, "published": "true", "limit": 10, "includes": "metadata"}
+# ---------------------------------------------------------
+# 3. BACKEND: OPEN-METEO (Climate Temp/Precip)
+# ---------------------------------------------------------
+def fetch_climate_projections(lat, lon):
+    """
+    Fetch CMIP6 Climate Data (1950-2050).
+    Returns DataFrame with Optimistic (Min) and Pessimistic (Max) scenarios.
+    """
+    url = "https://climate-api.open-meteo.com/v1/climate"
+    params = {
+        "latitude": lat, "longitude": lon,
+        "start_date": "1950-01-01", "end_date": "2050-12-31",
+        "models": ["CMCC_CM2_VHR4", "FGOALS_f3_H", "MRI_AGCM3_2_S", "EC_Earth3P_HR", "MPI_ESM1_2_XR"],
+        "daily": ["temperature_2m_mean", "precipitation_sum"],
+        "disable_downscaling": "false"
+    }
+    
     try:
-        return requests.get(url, params=params).json().get('data', [])
-    except Exception:
-        return []
+        r = requests.get(url, params=params, timeout=15)
+        data = r.json()
+        if "daily" not in data: return None
+        
+        daily = data["daily"]
+        time = pd.to_datetime(daily["time"])
+        df = pd.DataFrame({"time": time})
+        
+        # Helper to aggregate model data
+        def get_scenario_data(keyword):
+            cols = [k for k in daily.keys() if keyword in k]
+            vals = pd.DataFrame({k: daily[k] for k in cols})
+            return vals.min(axis=1), vals.max(axis=1), vals.mean(axis=1) # Min=Opt, Max=Pes, Mean=Base
 
-def inspect_columns(dataset_id):
-    url = f"https://api.resourcewatch.org/v1/query/{dataset_id}?sql=SELECT * FROM data LIMIT 1"
-    try:
-        return requests.get(url).json().get('data', [])
-    except Exception:
+        # Temperature
+        t_opt, t_pes, t_mean = get_scenario_data("temperature")
+        df["Temp_Opt"], df["Temp_Pes"], df["Temp_Mean"] = t_opt, t_pes, t_mean
+        
+        # Precipitation (Annual Sums require resampling later)
+        p_opt, p_pes, p_mean = get_scenario_data("precipitation")
+        df["Precip_Opt"], df["Precip_Pes"], df["Precip_Mean"] = p_opt, p_pes, p_mean
+        
+        return df.set_index("time")
+    except:
         return None
 
-# --- UI Helper ---
-def display_risk_badge(label):
-    if not label:
-        st.caption("No Data / Safe")
-        return
-        
-    l = str(label).lower()
-    if "extremely high" in l:
-        st.error(f"🔥 {label}")
-    elif "high" in l:
-        st.warning(f"⚠️ {label}")
-    elif "medium" in l:
-        st.info(f"💧 {label}")
-    elif "low" in l:
-        st.success(f"✅ {label}")
-    else:
-        st.write(f"ℹ️ {label}")
-
 # ---------------------------------------------------------
-# 3. FRONTEND UI
+# 4. FRONTEND UI
 # ---------------------------------------------------------
-st.set_page_config(page_title="Climate Hazard Dashboard", page_icon="🌍", layout="wide")
+st.set_page_config(page_title="Integrated Risk Report", page_icon="🌍", layout="wide")
 
-st.title("🌍 Climate Hazard Dashboard")
-st.markdown("Analyze **Water Stress, Drought, and Flood Risks** for any location.")
+st.title("🌍 Integrated Climate Risk Assessment")
+st.markdown("### Location Analysis")
 
-# --- INPUTS ---
-col1, col2 = st.columns(2)
-with col1:
-    lat_input = st.number_input("Latitude", value=33.4484, format="%.4f")
-with col2:
-    lon_input = st.number_input("Longitude", value=-112.0740, format="%.4f")
+col_in1, col_in2 = st.columns(2)
+with col_in1:
+    lat = st.number_input("Latitude", 33.4484, format="%.4f")
+with col_in2:
+    lon = st.number_input("Longitude", -112.0740, format="%.4f")
 
-# --- SECTION 1: CURRENT HAZARDS ---
-st.divider()
-st.subheader("1. Current Climate Hazards")
+# --- A. MAP SENSE CHECK ---
+map_df = pd.DataFrame({'lat': [lat], 'lon': [lon]})
+st.map(map_df, zoom=8)
 
-if st.button("Analyze Current Risks"):
-    with st.spinner("Querying hazard databases..."):
-        
-        # Dynamic Columns for each hazard
-        cols = st.columns(len(RISK_CONFIG))
-        
-        for idx, (name, config) in enumerate(RISK_CONFIG.items()):
-            with cols[idx]:
-                st.markdown(f"**{name}**")
-                res = fetch_risk_data(lat_input, lon_input, name)
-                
-                if "error" in res:
-                    st.error("API Error")
-                    with st.expander("Details"):
-                        st.write(res['error'])
-                else:
-                    # Parse config columns
-                    s_col, l_col = config['cols']
-                    
-                    score = res.get(s_col, 'N/A')
-                    label = res.get(l_col, None)
-                    
-                    if score != 'N/A':
-                        st.metric("Score", f"{score} / 5")
-                    else:
-                        st.metric("Score", "N/A")
-                        
-                    display_risk_badge(label)
-
-# --- SECTION 2: FUTURE PROJECTIONS ---
-st.divider()
-st.subheader("2. Future Water Stress (2030-2040)")
-
-if st.button("Predict Future Stress"):
-    with st.spinner("Projecting scenarios..."):
-        f_res = fetch_future_projections(lat_input, lon_input)
-        
-    if "error" in f_res:
-        st.warning(f_res["error"])
-    else:
-        # 2030 Row
-        st.markdown("### 📅 2030")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**🌱 Optimistic (RCP4.5)**")
-            display_risk_badge(f_res.get('ws3024tl'))
-        with c2:
-            st.markdown("**🏭 Business as Usual (RCP8.5)**")
-            display_risk_badge(f_res.get('ws3028tl'))
-
-        st.markdown("---")
-
-        # 2040 Row
-        st.markdown("### 📅 2040")
-        c3, c4 = st.columns(2)
-        with c3:
-            st.markdown("**🌱 Optimistic (RCP4.5)**")
-            display_risk_badge(f_res.get('ws4024tl'))
-        with c4:
-            st.markdown("**🏭 Business as Usual (RCP8.5)**")
-            display_risk_badge(f_res.get('ws4028tl'))
-
-# ---------------------------------------------------------
-# 4. SIDEBAR (DEVELOPER TOOLS)
-# ---------------------------------------------------------
-st.sidebar.header("🔧 Developer Tools")
-st.sidebar.markdown("Use these tools to find new datasets or fix column names.")
-st.sidebar.divider()
-
-# --- TOOL A: DATASET FINDER ---
-st.sidebar.subheader("🔎 Dataset Finder")
-search_term = st.sidebar.text_input("Search term", "Flood")
-
-if st.sidebar.button("Search API"):
-    with st.sidebar.status("Searching..."):
-        results = search_wri_datasets(search_term)
+if st.button("Generate Full Risk Report"):
+    progress = st.progress(0)
     
-    if results:
-        st.sidebar.success(f"Found {len(results)} datasets")
-        for ds in results:
-            with st.sidebar.expander(ds['attributes']['name']):
-                st.code(ds['id'])
-                st.caption(f"Provider: {ds['attributes']['provider']}")
-                st.json(ds)
-    else:
-        st.sidebar.warning("No datasets found.")
-
-st.sidebar.divider()
-
-# --- TOOL B: COLUMN INSPECTOR ---
-st.sidebar.subheader("🕵️ Column Inspector")
-st.sidebar.info("Paste a UUID here to see its table structure.")
-
-# Default to Drought Risk so you can check it easily
-inspect_id = st.sidebar.text_input("Dataset UUID", value="5c9507d1-47f7-4c6a-9e64-fc210ccc48e2")
-
-if st.sidebar.button("Inspect Columns"):
-    with st.sidebar.status("Fetching one row..."):
-        cols = inspect_columns(inspect_id)
+    # 1. Fetch WRI Hazards (25%)
+    drought = fetch_wri_current(lat, lon, "Drought Risk")
+    river = fetch_wri_current(lat, lon, "Riverine Flood")
+    coastal = fetch_wri_current(lat, lon, "Coastal Flood")
+    bws = fetch_wri_current(lat, lon, "Baseline Water Stress")
+    progress.progress(25)
     
-    if cols:
-        st.sidebar.success("Columns found!")
-        st.sidebar.write(list(cols[0].keys()))
-    else:
-        st.sidebar.error("Could not fetch data. Dataset might be empty.")
+    # 2. Fetch WRI Future (50%)
+    wri_future = fetch_wri_future(lat, lon)
+    progress.progress(50)
+    
+    # 3. Fetch Climate Data (75%)
+    clim_df = fetch_climate_projections(lat, lon)
+    progress.progress(90)
+    
+    # 4. Process Data for Table
+    
+    # --- Climate Calculations ---
+    # Baseline: 1990-2020 Mean
+    base_temp = "N/A"
+    base_precip = "N/A"
+    
+    # Future Time Horizons (using 5-year windows around target)
+    # Current ~ 2025. +10Y=2035, +20Y=2045, +30Y=2050 (Max data)
+    
+    scenarios = {
+        "Current (Baseline)": {},
+        "+10Y (Optimistic)": {}, "+10Y (Business as Usual)": {},
+        "+20Y (Optimistic)": {}, "+20Y (Business as Usual)": {},
+        "+30Y (Optimistic)": {}, "+30Y (Business as Usual)": {},
+    }
+    
+    if clim_df is not None:
+        # Resample to Annual
+        annual = clim_df.resample('Y').agg({
+            "Temp_Mean": "mean", "Temp_Opt": "mean", "Temp_Pes": "mean",
+            "Precip_Mean": "sum", "Precip_Opt": "sum", "Precip_Pes": "sum"
+        })
+        
+        # Baseline
+        base_period = annual.loc["1990":"2020"]
+        b_t = base_period["Temp_Mean"].mean()
+        b_p = base_period["Precip_Mean"].mean()
+        scenarios["Current (Baseline)"] = {"Temp": f"{b_t:.1f}°C", "Precip": f"{b_p:.0f} mm"}
+        
+        # Helper to extract future
+        def get_clim_val(year, col, is_temp=True):
+            try:
+                # 5 year window
+                start, end = str(year-2), str(year+2)
+                val = annual.loc[start:end][col].mean()
+                return f"{val:.1f}°C" if is_temp else f"{val:.0f} mm"
+            except: return "N/A"
+
+        # +10Y (2035)
+        scenarios["+10Y (Optimistic)"]["Temp"] = get_clim_val(2035, "Temp_Opt")
+        scenarios["+10Y (Optimistic)"]["Precip"] = get_clim_val(2035, "Precip_Opt", False)
+        scenarios["+10Y (Business as Usual)"]["Temp"] = get_clim_val(2035, "Temp_Pes")
+        scenarios["+10Y (Business as Usual)"]["Precip"] = get_clim_val(2035, "Precip_Pes", False)
+
+        # +20Y (2045)
+        scenarios["+20Y (Optimistic)"]["Temp"] = get_clim_val(2045, "Temp_Opt")
+        scenarios["+20Y (Optimistic)"]["Precip"] = get_clim_val(2045, "Precip_Opt", False)
+        scenarios["+20Y (Business as Usual)"]["Temp"] = get_clim_val(2045, "Temp_Pes")
+        scenarios["+20Y (Business as Usual)"]["Precip"] = get_clim_val(2045, "Precip_Pes", False)
+        
+        # +30Y (2050 - Max available)
+        scenarios["+30Y (Optimistic)"]["Temp"] = get_clim_val(2050, "Temp_Opt")
+        scenarios["+30Y (Optimistic)"]["Precip"] = get_clim_val(2050, "Precip_Opt", False)
+        scenarios["+30Y (Business as Usual)"]["Temp"] = get_clim_val(2050, "Temp_Pes")
+        scenarios["+30Y (Business as Usual)"]["Precip"] = get_clim_val(2050, "Precip_Pes", False)
+
+    # --- Water Stress Integration ---
+    # WRI has 2030 (+5Y approx) and 2040 (+15Y approx).
+    # We will map 2030 -> +10Y slot, 2040 -> +20Y slot.
+    
+    scenarios["Current (Baseline)"]["Water Stress"] = bws
+    
+    # 2030 Data
+    scenarios["+10Y (Optimistic)"]["Water Stress"] = wri_future.get("ws3024tl", "N/A")
+    scenarios["+10Y (Business as Usual)"]["Water Stress"] = wri_future.get("ws3028tl", "N/A")
+    
+    # 2040 Data
+    scenarios["+20Y (Optimistic)"]["Water Stress"] = wri_future.get("ws4024tl", "N/A")
+    scenarios["+20Y (Business as Usual)"]["Water Stress"] = wri_future.get("ws4028tl", "N/A")
+    
+    # 2050 Data (Not available in this WRI dataset)
+    scenarios["+30Y (Optimistic)"]["Water Stress"] = "N/A (Limit 2040)"
+    scenarios["+30Y (Business as Usual)"]["Water Stress"] = "N/A (Limit 2040)"
+
+    progress.progress(100)
+    
+    # --- OUTPUT DISPLAY ---
+    st.divider()
+    
+    # 1. Current Hazards Summary
+    st.subheader("⚠️ Current Hazard Profile")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Drought Risk", drought)
+    c2.metric("Riverine Flood", river)
+    c3.metric("Coastal Flood", coastal)
+    
+    st.divider()
+    
+    # 2. Integrated Table
+    st.subheader("🔮 Projected Trends (Temperature, Precip, Water Stress)")
+    
+    # Convert dictionary to DataFrame for display
+    # We want rows = Metrics, Cols = Scenarios
+    
+    table_data = []
+    
+    # Define column order
+    cols_order = [
+        "Current (Baseline)", 
+        "+10Y (Optimistic)", "+10Y (Business as Usual)",
+        "+20Y (Optimistic)", "+20Y (Business as Usual)",
+        "+30Y (Optimistic)", "+30Y (Business as Usual)"
+    ]
+    
+    metrics = ["Temp", "Precip", "Water Stress"]
+    
+    for metric in metrics:
+        row = {"Metric": metric}
+        for col in cols_order:
+            row[col] = scenarios.get(col, {}).get(metric, "N/A")
+        table_data.append(row)
+        
+    df_display = pd.DataFrame(table_data)
+    
+    # Styling for the table
+    st.dataframe(
+        df_display,
+        column_config={
+            "Metric": st.column_config.TextColumn("Indicator", width="medium"),
+        },
+        hide_index=True,
+        use_container_width=True
+    )
+    
+    st.caption("Note: Climate data uses CMIP6 ensemble (Min=Optimistic, Max=BAU/Pessimistic). Water Stress uses WRI Aqueduct 2.1 (2030/2040). +30Y Climate is capped at 2050.")
