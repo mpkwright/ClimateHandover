@@ -40,3 +40,17 @@ def search_future_datasets():
 
 if __name__ == "__main__":
     search_future_datasets()
+
+# Add this to the bottom of wri_api.py
+if __name__ == "__main__":
+    print("🔍 Debug Mode: Searching for datasets...")
+    results = search_future_datasets()
+    
+    if results:
+        for ds in results:
+            print(f"\n📂 Name: {ds['attributes']['name']}")
+            print(f"🆔 UUID: {ds['id']}")
+            print(f"🏭 Provider: {ds['attributes']['provider']}")
+            print("-" * 30)
+    else:
+        print("❌ No datasets found or an error occurred.")
