@@ -146,3 +146,38 @@ if st.sidebar.button("Search"):
         with st.sidebar.expander(ds['attributes']['name']):
             st.code(ds['id'])
             st.json(ds)
+
+# ---------------------------------------------------------
+# PASTE THIS INTO YOUR SIDEBAR SECTION IN app.py
+# ---------------------------------------------------------
+st.sidebar.divider()
+st.sidebar.subheader("🕵️ Column Inspector")
+
+# Paste your Future UUID here to check it
+inspect_id = st.sidebar.text_input("Dataset UUID to Inspect", value="2a571044-1a31-4092-9af8-48f406f13072")
+
+if st.sidebar.button("Show Columns"):
+    # Query just 1 row to see the table structure
+    inspect_url = f"https://api.resourcewatch.org/v1/query/{inspect_id}?sql=SELECT * FROM data LIMIT 1"
+    
+    try:
+        r = requests.get(inspect_url)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            if data:
+                # Get the first row keys (column names)
+                columns = list(data[0].keys())
+                st.sidebar.success(f"Found {len(columns)} columns!")
+                st.sidebar.write(columns) # Prints list of all column names
+                
+                # Check for common Future keywords
+                future_cols = [c for c in columns if "30" in c or "40" in c or "20" in c]
+                if future_cols:
+                    st.sidebar.info("Possible Future Columns:")
+                    st.sidebar.json(future_cols)
+            else:
+                st.sidebar.warning("Dataset is empty or permissions block access.")
+        else:
+            st.sidebar.error(f"Error {r.status_code}: {r.text}")
+    except Exception as e:
+        st.sidebar.error(f"Failed: {e}")
