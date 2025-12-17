@@ -207,4 +207,111 @@ def get_water_risk_data(lat, lon):
     
     return {
         "baseline": base_data,
-        "future
+        "future": None # Future WRI columns are often protected/renamed. We focus on Baseline accuracy.
+    }
+
+# --- 5. RISK CALCULATION & TABLE ---
+def calculate_risk_table(climate_data, water_data):
+    b_t = climate_data["baseline_temp"]
+    b_p = climate_data["baseline_precip"]
+    
+    def get_climate_labels(t, p):
+        drought = "High" if p < 500 else ("Medium" if p < 800 else "Low")
+        flood = "High" if p > 1200 else ("Medium" if p > 800 else "Low")
+        wildfire = "High" if (t > 15 and p < 600) else "Low"
+        return drought, flood, wildfire
+
+    rows = []
+    
+    # 1. Current Row
+    d, f, w = get_climate_labels(b_t, b_p)
+    
+    ws_base = "No Data"
+    if water_data and water_data['baseline']:
+        ws_base = water_data['baseline'].get('bws_label', 'No Data')
+    
+    rows.append({
+        "Scenario": "Current Baseline",
+        "Decade": "1991-2020",
+        "Temp": f"{b_t:.2f} °C",
+        "Precip": f"{b_p:.0f} mm",
+        "Water Stress (WRI)": ws_base,
+        "Drought Risk": d, "Flood Risk": f, "Wildfire Risk": w
+    })
+    
+    # 2. Future Rows
+    for sc_name, decades in climate_data["future"].items():
+        for dec_name, metrics in decades.items():
+            
+            delta_t = metrics["temp"] - b_t
+            delta_p_pct = ((metrics["precip"] - b_p) / b_p) * 100 if b_p != 0 else 0
+            
+            fd, ff, fw = get_climate_labels(metrics["temp"], metrics["precip"])
+            
+            # For Future Water Stress, we project based on Baseline + Climate Signal
+            # (Since WRI Future columns are unstable in public API)
+            ws_future = ws_base
+            if "High" in ws_base and delta_p_pct < -5:
+                ws_future = "Extremely High (Projected)"
+            elif delta_p_pct < -10:
+                ws_future = f"{ws_base} (Worsening)"
+            
+            rows.append({
+                "Scenario": sc_name,
+                "Decade": dec_name,
+                "Temp": f"{'+' if delta_t>0 else ''}{delta_t:.2f} °C",
+                "Precip": f"{'+' if delta_p_pct>0 else ''}{delta_p_pct:.1f} %",
+                "Water Stress (WRI)": ws_future,
+                "Drought Risk": fd, "Flood Risk": ff, "Wildfire Risk": fw
+            })
+
+    return pd.DataFrame(rows)
+
+# --- 6. VISUALIZATION ---
+def plot_chart(monthly):
+    src = monthly.reset_index()
+    src['month_name'] = pd.to_datetime(src['index'], format='%m').dt.month_name().str.slice(stop=3)
+    base = alt.Chart(src).encode(x=alt.X('month_name', sort=None, title='Month'))
+    bar = base.mark_bar(opacity=0.5, color='#4c78a8').encode(y='precip_total', tooltip='precip_total')
+    line = base.mark_line(color='#e45756', strokeWidth=3).encode(y='temp', tooltip='temp')
+    return alt.layer(bar, line).resolve_scale(y='independent').properties(title="Seasonal Baseline (1991-2020)")
+
+def style_rows(val):
+    s = str(val).lower()
+    if 'high' in s or 'extremely' in s: return 'background-color: #ffcccc; color: black'
+    if 'med' in s: return 'background-color: #fff4cc; color: black'
+    if 'low' in s: return 'background-color: #ccffcc; color: black'
+    if 'arid' in s: return 'background-color: #ffcccc; color: black'
+    return ''
+
+# --- 7. MAIN ---
+if run_btn:
+    with st.spinner("Fetching Climate Models & WRI Aqueduct Data..."):
+        c_data = get_climate_data(lat, lon)
+        w_data = get_water_risk_data(lat, lon)
+        
+        if c_data:
+            st.subheader(f"📍 Analysis for: {get_location_name(lat, lon)}")
+            st.map(pd.DataFrame({'lat':[lat], 'lon':[lon]}), zoom=4)
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Baseline Temp", f"{c_data['baseline_temp']:.1f}°C")
+            c2.metric("Baseline Precip", f"{c_data['baseline_precip']:.0f}mm")
+            
+            ws_val = w_data['baseline'].get('bws_label', 'No Data') if (w_data and w_data['baseline']) else "No Data"
+            c3.metric("Current Water Stress", ws_val)
+            
+            st.markdown("### 🔮 Decadal Risk Pathways")
+            df = calculate_risk_table(c_data, w_data)
+            
+            st.dataframe(
+                df.style.applymap(style_rows), 
+                use_container_width=True,
+                column_order=["Scenario", "Decade", "Temp", "Precip", "Water Stress (WRI)", "Drought Risk", "Flood Risk", "Wildfire Risk"]
+            )
+            
+            st.altair_chart(plot_chart(c_data['monthly']), use_container_width=True)
+        else:
+            st.error("Data Unavailable.")
+else:
+    st.info("👈 Enter Latitude/Longitude in the sidebar and click 'Generate' to start.")
