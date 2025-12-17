@@ -1,54 +1,74 @@
+import streamlit as st
 import requests
-import json
 
-# This is the UUID we found for "Aqueduct Baseline Water Stress"
-# We hardcode it so we don't have to search for it every time.
+# ---------------------------------------------------------
+# 1. CONFIGURATION
+# ---------------------------------------------------------
+# The UUID for the "Aqueduct Baseline Water Stress" dataset
 DATASET_ID = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840"
 
-def get_water_risk(lat, lon):
+# ---------------------------------------------------------
+# 2. BACKEND FUNCTION (Logic only, no display)
+# ---------------------------------------------------------
+def fetch_water_risk(lat, lon):
     """
-    Fetches the Baseline Water Stress for a specific coordinate.
+    Queries the WRI API for water risk data at a specific lat/lon.
+    Returns a dictionary with data or None if failed.
     """
-    print(f"🌍 Checking Water Stress at {lat}, {lon}...")
-
-    # WRI allows SQL-like queries. 
-    # ST_Intersects checks if our Point(lon, lat) is inside the dataset's Polygon geometry.
-    # We SELECT only the useful columns (score and label) to keep the output clean.
+    # SQL query to find the polygon containing the point
     sql_query = f"""
         SELECT bws_label, bws_score 
         FROM {DATASET_ID} 
         WHERE ST_Intersects(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326))
     """
-
+    
     url = f"https://api.resourcewatch.org/v1/query/{DATASET_ID}"
     params = {"sql": sql_query}
 
     try:
         response = requests.get(url, params=params)
-        
         if response.status_code == 200:
             data = response.json().get('data', [])
-            
             if data:
-                # We found a match!
-                result = data[0]
-                print(f"✅ Status: {result.get('bws_label', 'Unknown')}")
-                print(f"📊 Score:  {result.get('bws_score', 'N/A')} / 5")
+                return data[0]  # Return the first match
             else:
-                print("🤷 No data found for this specific location (might be in the ocean or outside coverage).")
-                
+                return {"error": "No data found for this location."}
         else:
-            print(f"❌ Error: {response.status_code}")
-            print(response.text)
-
+            return {"error": f"API Error: {response.status_code}"}
     except Exception as e:
-        print(f"An error occurred: {e}")
+        return {"error": str(e)}
 
-if __name__ == "__main__":
-    # Test with a location: London, UK (usually Low stress)
-    get_water_risk(51.5074, -0.1278)
+# ---------------------------------------------------------
+# 3. FRONTEND (The Streamlit UI)
+# ---------------------------------------------------------
+st.title("💧 Water Risk Checker")
+st.markdown("Enter coordinates to check the **Baseline Water Stress** from the WRI Aqueduct dataset.")
+
+# Input columns
+col1, col2 = st.columns(2)
+with col1:
+    lat_input = st.number_input("Latitude", value=51.5074, format="%.4f")
+with col2:
+    lon_input = st.number_input("Longitude", value=-0.1278, format="%.4f")
+
+if st.button("Check Risk Level"):
+    with st.spinner("Querying WRI Database..."):
+        result = fetch_water_risk(lat_input, lon_input)
     
-    print("-" * 20)
-    
-    # Test with a location: Phoenix, Arizona (High stress)
-    get_water_risk(33.4484, -112.0740)
+    # Check if we got a valid result or an error
+    if "error" in result:
+        st.warning(result["error"])
+    else:
+        # Success! Display Metrics
+        label = result.get('bws_label', 'Unknown')
+        score = result.get('bws_score', 'N/A')
+        
+        # Color code the result
+        if score != 'N/A' and float(score) >= 4:
+            st.error(f"Risk Level: {label}")
+        elif score != 'N/A' and float(score) >= 2:
+            st.warning(f"Risk Level: {label}")
+        else:
+            st.success(f"Risk Level: {label}")
+            
+        st.metric(label="Water Stress Score (0-5)", value=f"{score} / 5")
