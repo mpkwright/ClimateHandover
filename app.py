@@ -18,43 +18,31 @@ FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 # 2. BACKEND: WRI API (Hazards)
 # ---------------------------------------------------------
 def fetch_wri_current(lat, lon, risk_name):
-    """Fetch current risk scores for a specific hazard."""
+    """Fetch current risk scores."""
     config = RISK_CONFIG[risk_name]
     uuid = config['uuid']
     s_col, l_col = config['cols']
     
-    # Flatten SQL to prevent parsing errors
+    # STRICT Single-line query that we know works
     sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    url = f"https://api.resourcewatch.org/v1/query/{uuid}"
     
+    url = f"https://api.resourcewatch.org/v1/query/{uuid}"
     try:
         r = requests.get(url, params={"sql": sql}, timeout=10)
         if r.status_code == 200:
             data = r.json().get('data', [])
-            if data:
-                return data[0].get(l_col, "N/A")
+            if data: return data[0].get(l_col, "N/A")
         return "N/A"
     except:
         return "N/A"
 
 def fetch_wri_future(lat, lon):
     """
-    Fetch Future Water Stress for 2030 & 2040.
-    Fetches BOTH labels (tl) and scores (tr) to ensure no data is missed.
+    Fetch Future Water Stress (2030 & 2040).
+    Reverted to strict ST_Intersects with simple string formatting.
     """
-    # Query 8 columns: 4 Scenarios * (Score + Label)
-    sql = f"""
-    SELECT 
-        ws3024tr, ws3024tl, -- 2030 Optimistic (SSP2-4.5)
-        ws3028tr, ws3028tl, -- 2030 BAU (SSP2-8.5)
-        ws4024tr, ws4024tl, -- 2040 Optimistic
-        ws4028tr, ws4028tl  -- 2040 BAU
-    FROM data 
-    WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))
-    """
-    
-    # Flatten string for API safety
-    sql = " ".join(sql.split())
+    # STRICT Single-line query. No newlines, no comments.
+    sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
     
@@ -70,13 +58,10 @@ def fetch_wri_future(lat, lon):
                 def get_val(year, scen, row_data):
                     l_key = f"ws{year}{scen}tl"
                     s_key = f"ws{year}{scen}tr"
-                    
                     label = row_data.get(l_key)
                     score = row_data.get(s_key)
                     
                     if label: return label
-                    
-                    # Fallback logic
                     if score is not None:
                         s = float(score)
                         if s >= 4: return "Extremely High (>4)"
@@ -84,7 +69,6 @@ def fetch_wri_future(lat, lon):
                         if s >= 2: return "Medium-High (2-3)"
                         if s >= 1: return "Low-Medium (1-2)"
                         return "Low (<1)"
-                    
                     return "N/A"
 
                 return {
@@ -94,7 +78,7 @@ def fetch_wri_future(lat, lon):
                     "ws4028tl": get_val("40", "28", row)
                 }
         return {}
-    except:
+    except Exception as e:
         return {}
 
 # ---------------------------------------------------------
@@ -103,54 +87,56 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     """
     Fetch CMIP6 Climate Data (1950-2050).
-    FIX: Aggregates to Annual Data PER MODEL first.
-    Proxies: Min Model -> Optimistic Bound, Max Model -> BAU Bound.
+    Uses Standard Reliable Models (EC-Earth3 etc) to avoid timeouts.
     """
     url = "https://climate-api.open-meteo.com/v1/climate"
+    
+    # Safe, standard models that don't timeout
+    safe_models = [
+        "ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"
+    ]
+    
     params = {
         "latitude": lat, "longitude": lon,
         "start_date": "1950-01-01", "end_date": "2050-12-31",
-        "models": ["CMCC_CM2_VHR4", "FGOALS_f3_H", "MRI_AGCM3_2_S", "EC_Earth3P_HR", "MPI_ESM1_2_XR"],
+        "models": safe_models,
         "daily": ["temperature_2m_mean", "precipitation_sum"],
         "disable_downscaling": "false"
     }
     
     try:
-        r = requests.get(url, params=params, timeout=15)
+        r = requests.get(url, params=params, timeout=20)
         data = r.json()
+        
         if "daily" not in data: return None
         
         daily = data["daily"]
         time = pd.to_datetime(daily["time"])
         
-        # 1. Load Raw Data
         df_raw = pd.DataFrame(daily)
         df_raw["time"] = time
         df_raw.set_index("time", inplace=True)
         
-        # 2. Identify Columns
+        # Identify columns
         temp_cols = [c for c in df_raw.columns if "temperature" in c]
         precip_cols = [c for c in df_raw.columns if "precipitation" in c]
         
-        # 3. Resample to ANNUAL Frequency PER MODEL FIRST
-        # This is the critical fix for the "giggle test"
-        annual_temp_models = df_raw[temp_cols].resample("Y").mean()
-        annual_precip_models = df_raw[precip_cols].resample("Y").sum()
+        # Resample to ANNUAL Frequency PER MODEL FIRST (Fixes math error)
+        annual_temp = df_raw[temp_cols].resample("Y").mean()
+        annual_precip = df_raw[precip_cols].resample("Y").sum()
         
-        # 4. Calculate Scenarios (Ensemble Spread)
-        df_out = pd.DataFrame(index=annual_temp_models.index)
+        # Calculate Scenarios
+        df_out = pd.DataFrame(index=annual_temp.index)
         
-        # Optimistic Proxy = Min Model
-        df_out["Temp_Opt"] = annual_temp_models.min(axis=1)
-        df_out["Precip_Opt"] = annual_precip_models.min(axis=1)
+        # Optimistic (Min) & BAU (Max)
+        df_out["Temp_Opt"] = annual_temp.min(axis=1)
+        df_out["Precip_Opt"] = annual_precip.min(axis=1)
         
-        # BAU/Pessimistic Proxy = Max Model
-        df_out["Temp_BAU"] = annual_temp_models.max(axis=1)
-        df_out["Precip_BAU"] = annual_precip_models.max(axis=1)
+        df_out["Temp_BAU"] = annual_temp.max(axis=1)
+        df_out["Precip_BAU"] = annual_precip.max(axis=1)
         
-        # Mean
-        df_out["Temp_Mean"] = annual_temp_models.mean(axis=1)
-        df_out["Precip_Mean"] = annual_precip_models.mean(axis=1)
+        df_out["Temp_Mean"] = annual_temp.mean(axis=1)
+        df_out["Precip_Mean"] = annual_precip.mean(axis=1)
         
         return df_out
         
@@ -211,7 +197,6 @@ if st.button("Generate Full Risk Report"):
         
         def get_clim(year, col, unit="°C", is_sum=False):
             try:
-                # 5-year average window
                 start, end = str(year-2), str(year+2)
                 val = clim_df.loc[start:end][col].mean()
                 return f"{val:.0f} {unit}" if is_sum else f"{val:.1f}{unit}"
@@ -237,16 +222,10 @@ if st.button("Generate Full Risk Report"):
 
     # Water Stress (WRI)
     scenarios["Current (Baseline)"]["Water Stress"] = bws
-    
-    # Map WRI 2030 -> +10Y
     scenarios["+10Y (Optimistic Proxy)"]["Water Stress"] = wri_future.get("ws3024tl", "N/A")
     scenarios["+10Y (BAU Proxy)"]["Water Stress"] = wri_future.get("ws3028tl", "N/A")
-    
-    # Map WRI 2040 -> +20Y
     scenarios["+20Y (Optimistic Proxy)"]["Water Stress"] = wri_future.get("ws4024tl", "N/A")
     scenarios["+20Y (BAU Proxy)"]["Water Stress"] = wri_future.get("ws4028tl", "N/A")
-    
-    # 2050 Limit
     scenarios["+30Y (Optimistic Proxy)"]["Water Stress"] = "N/A (Limit 2040)"
     scenarios["+30Y (BAU Proxy)"]["Water Stress"] = "N/A (Limit 2040)"
 
@@ -279,15 +258,3 @@ if st.button("Generate Full Risk Report"):
         table_data.append(row)
         
     st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-    
-    with st.expander("ℹ️ Data Methodology"):
-        st.write("""
-        - **Temperature & Precipitation:** Derived from Open-Meteo CMIP6 High-Res Ensemble (5 models). 
-          - **Optimistic Proxy** = Minimum of model ensemble (Lowest Warming).
-          - **BAU Proxy** = Maximum of model ensemble (Highest Warming).
-          - *Note: Open-Meteo does not allow direct SSP scenario selection; min/max spread is the standard proxy.*
-        - **Water Stress:** Derived from WRI Aqueduct 2.1.
-          - **Optimistic** = Scenario 24 (SSP2 RCP4.5).
-          - **BAU** = Scenario 28 (SSP2 RCP8.5).
-        - **+10Y / +20Y / +30Y:** Approximated as 2035, 2045, and 2050 respectively.
-        """)
