@@ -18,14 +18,10 @@ FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 # 2. BACKEND: WRI API (Hazards)
 # ---------------------------------------------------------
 def fetch_wri_current(lat, lon, risk_name):
-    """Fetch current risk scores."""
     config = RISK_CONFIG[risk_name]
     uuid = config['uuid']
     s_col, l_col = config['cols']
-    
-    # Strict single-line query
     sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    
     url = f"https://api.resourcewatch.org/v1/query/{uuid}"
     try:
         r = requests.get(url, params={"sql": sql}, timeout=10)
@@ -37,27 +33,17 @@ def fetch_wri_current(lat, lon, risk_name):
         return "N/A"
 
 def fetch_wri_future(lat, lon):
-    """
-    Fetch Future Water Stress (2030 & 2040).
-    """
     sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    
     url = f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}"
-    
     try:
         r = requests.get(url, params={"sql": sql}, timeout=10)
-        
         if r.status_code == 200:
             data = r.json().get('data', [])
             if data:
                 row = data[0]
-                
                 def get_val(year, scen, row_data):
-                    l_key = f"ws{year}{scen}tl"
-                    s_key = f"ws{year}{scen}tr"
-                    label = row_data.get(l_key)
-                    score = row_data.get(s_key)
-                    
+                    l_key, s_key = f"ws{year}{scen}tl", f"ws{year}{scen}tr"
+                    label, score = row_data.get(l_key), row_data.get(s_key)
                     if label: return label
                     if score is not None:
                         s = float(score)
@@ -67,69 +53,73 @@ def fetch_wri_future(lat, lon):
                         if s >= 1: return "Low-Medium (1-2)"
                         return "Low (<1)"
                     return "N/A"
-
                 return {
-                    "ws3024tl": get_val("30", "24", row),
-                    "ws3028tl": get_val("30", "28", row),
-                    "ws4024tl": get_val("40", "24", row),
-                    "ws4028tl": get_val("40", "28", row)
+                    "ws3024tl": get_val("30", "24", row), "ws3028tl": get_val("30", "28", row),
+                    "ws4024tl": get_val("40", "24", row), "ws4028tl": get_val("40", "28", row)
                 }
         return {}
-    except Exception as e:
+    except:
         return {}
 
 # ---------------------------------------------------------
-# 3. BACKEND: OPEN-METEO (Climate Temp/Precip)
+# 3. BACKEND: OPEN-METEO (Climate) - FIXED
 # ---------------------------------------------------------
 def fetch_climate_projections(lat, lon):
     """
-    Fetch CMIP6 Climate Data (1950-2050).
-    SIMPLIFIED: Calculates the robust AVERAGE of all models.
+    Fetch CMIP6 Climate Data.
+    BACK TO BASICS: Uses the correct Capitalized Model Names and prints errors if it fails.
     """
     url = "https://climate-api.open-meteo.com/v1/climate"
     
-    # Standard Reliable Models
+    # These are the Exact Valid Model Names (Case Sensitive)
+    # Reverting to the list that worked previously
+    models = ["CMCC_CM2_VHR4", "FGOALS_f3_H", "MRI_AGCM3_2_S", "EC_Earth3P_HR", "MPI_ESM1_2_XR"]
+    
     params = {
-        "latitude": lat, "longitude": lon,
-        "start_date": "1950-01-01", "end_date": "2050-12-31",
-        "models": ["ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"],
+        "latitude": lat, 
+        "longitude": lon,
+        "start_date": "1950-01-01", 
+        "end_date": "2050-12-31",
+        "models": models,
         "daily": ["temperature_2m_mean", "precipitation_sum"],
         "disable_downscaling": "false"
     }
     
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        if "daily" not in data: return None
-        
-        daily = data["daily"]
-        time = pd.to_datetime(daily["time"])
-        
-        # 1. Load Raw Data
-        df = pd.DataFrame(daily)
-        df["time"] = time
-        df.set_index("time", inplace=True)
-        
-        # 2. Identify Columns
-        temp_cols = [c for c in df.columns if "temperature" in c]
-        precip_cols = [c for c in df.columns if "precipitation" in c]
-        
-        # 3. Calculate Ensemble Mean (Daily)
-        # We just take the average of all models. This is safe and robust.
-        df["Temp_Mean"] = df[temp_cols].mean(axis=1)
-        df["Precip_Mean"] = df[precip_cols].mean(axis=1)
-        
-        # 4. Resample to Annual
-        # Temp = Mean of daily means
-        # Precip = Sum of daily means (Total annual rainfall)
-        annual = pd.DataFrame()
-        annual["Temp_Mean"] = df["Temp_Mean"].resample("Y").mean()
-        annual["Precip_Mean"] = df["Precip_Mean"].resample("Y").sum()
-        
-        return annual
-        
-    except Exception as e:
+    # REMOVED the broad try/except so we can see the actual error if it fails
+    response = requests.get(url, params=params, timeout=25) 
+    
+    if response.status_code != 200:
+        st.error(f"Open-Meteo Error {response.status_code}: {response.text}")
         return None
+        
+    data = response.json()
+    if "daily" not in data:
+        st.error("API returned data but no 'daily' key found.")
+        return None
+    
+    daily = data["daily"]
+    time = pd.to_datetime(daily["time"])
+    
+    df = pd.DataFrame(daily)
+    df["time"] = time
+    df.set_index("time", inplace=True)
+    
+    # Identify columns
+    temp_cols = [c for c in df.columns if "temperature" in c]
+    precip_cols = [c for c in df.columns if "precipitation" in c]
+    
+    # 1. Average Daily Values across all models (Ensemble Mean)
+    df["Temp_Daily_Avg"] = df[temp_cols].mean(axis=1)
+    df["Precip_Daily_Avg"] = df[precip_cols].mean(axis=1)
+    
+    # 2. Resample to Annual
+    # Temp: Annual Average of daily averages
+    # Precip: Annual Sum of daily averages
+    annual = pd.DataFrame()
+    annual["Temp_Mean"] = df["Temp_Daily_Avg"].resample("Y").mean()
+    annual["Precip_Mean"] = df["Precip_Daily_Avg"].resample("Y").sum()
+    
+    return annual
 
 # ---------------------------------------------------------
 # 4. FRONTEND UI
@@ -137,7 +127,6 @@ def fetch_climate_projections(lat, lon):
 st.set_page_config(page_title="Integrated Risk Report", page_icon="🌍", layout="wide")
 
 st.title("🌍 Integrated Climate Risk Assessment")
-st.markdown("### Location Analysis")
 
 col_in1, col_in2 = st.columns(2)
 with col_in1:
@@ -145,38 +134,36 @@ with col_in1:
 with col_in2:
     lon = st.number_input("Longitude", -112.0740, format="%.4f")
 
-# Map Check
 map_df = pd.DataFrame({'lat': [lat], 'lon': [lon]})
 st.map(map_df, zoom=8)
 
 if st.button("Generate Full Risk Report"):
     progress = st.progress(0)
     
-    # 1. Fetch Hazards
+    # 1. Hazards
     drought = fetch_wri_current(lat, lon, "Drought Risk")
     river = fetch_wri_current(lat, lon, "Riverine Flood")
     coastal = fetch_wri_current(lat, lon, "Coastal Flood")
     bws = fetch_wri_current(lat, lon, "Baseline Water Stress")
     progress.progress(30)
     
-    # 2. Fetch Future Water
+    # 2. Future Water
     wri_future = fetch_wri_future(lat, lon)
     progress.progress(60)
     
-    # 3. Fetch Climate
+    # 3. Climate
     clim_df = fetch_climate_projections(lat, lon)
     progress.progress(90)
     
     # 4. Process Data
     scenarios = {
         "Current (Baseline)": {},
-        "+10Y (Optimistic Proxy)": {}, "+10Y (BAU Proxy)": {},
-        "+20Y (Optimistic Proxy)": {}, "+20Y (BAU Proxy)": {},
-        "+30Y (Optimistic Proxy)": {}, "+30Y (BAU Proxy)": {},
+        "+10Y (Optimistic)": {}, "+10Y (BAU)": {},
+        "+20Y (Optimistic)": {}, "+20Y (BAU)": {},
+        "+30Y (Optimistic)": {}, "+30Y (BAU)": {},
     }
     
     if clim_df is not None:
-        # Baseline (1990-2020)
         base = clim_df.loc["1990":"2020"]
         scenarios["Current (Baseline)"] = {
             "Temp": f"{base['Temp_Mean'].mean():.1f}°C",
@@ -185,46 +172,33 @@ if st.button("Generate Full Risk Report"):
         
         def get_clim(year, col, unit="°C", is_sum=False):
             try:
-                # 5-year average window
                 start, end = str(year-2), str(year+2)
                 val = clim_df.loc[start:end][col].mean()
                 return f"{val:.0f} {unit}" if is_sum else f"{val:.1f}{unit}"
             except: return "N/A"
 
-        # NOTE: We populate both scenarios with the Ensemble Mean
-        
-        # +10Y (2035)
-        scenarios["+10Y (Optimistic Proxy)"]["Temp"] = get_clim(2035, "Temp_Mean")
-        scenarios["+10Y (Optimistic Proxy)"]["Precip"] = get_clim(2035, "Precip_Mean", "mm", True)
-        scenarios["+10Y (BAU Proxy)"]["Temp"] = get_clim(2035, "Temp_Mean")
-        scenarios["+10Y (BAU Proxy)"]["Precip"] = get_clim(2035, "Precip_Mean", "mm", True)
+        # Populating both columns with the Ensemble Mean
+        for year, label in [(2035, "+10Y"), (2045, "+20Y"), (2050, "+30Y")]:
+            t_val = get_clim(year, "Temp_Mean")
+            p_val = get_clim(year, "Precip_Mean", "mm", True)
+            
+            scenarios[f"{label} (Optimistic)"]["Temp"] = t_val
+            scenarios[f"{label} (Optimistic)"]["Precip"] = p_val
+            scenarios[f"{label} (BAU)"]["Temp"] = t_val
+            scenarios[f"{label} (BAU)"]["Precip"] = p_val
 
-        # +20Y (2045)
-        scenarios["+20Y (Optimistic Proxy)"]["Temp"] = get_clim(2045, "Temp_Mean")
-        scenarios["+20Y (Optimistic Proxy)"]["Precip"] = get_clim(2045, "Precip_Mean", "mm", True)
-        scenarios["+20Y (BAU Proxy)"]["Temp"] = get_clim(2045, "Temp_Mean")
-        scenarios["+20Y (BAU Proxy)"]["Precip"] = get_clim(2045, "Precip_Mean", "mm", True)
-        
-        # +30Y (2050)
-        scenarios["+30Y (Optimistic Proxy)"]["Temp"] = get_clim(2050, "Temp_Mean")
-        scenarios["+30Y (Optimistic Proxy)"]["Precip"] = get_clim(2050, "Precip_Mean", "mm", True)
-        scenarios["+30Y (BAU Proxy)"]["Temp"] = get_clim(2050, "Temp_Mean")
-        scenarios["+30Y (BAU Proxy)"]["Precip"] = get_clim(2050, "Precip_Mean", "mm", True)
-
-    # Water Stress (WRI)
+    # Water Stress
     scenarios["Current (Baseline)"]["Water Stress"] = bws
-    scenarios["+10Y (Optimistic Proxy)"]["Water Stress"] = wri_future.get("ws3024tl", "N/A")
-    scenarios["+10Y (BAU Proxy)"]["Water Stress"] = wri_future.get("ws3028tl", "N/A")
-    scenarios["+20Y (Optimistic Proxy)"]["Water Stress"] = wri_future.get("ws4024tl", "N/A")
-    scenarios["+20Y (BAU Proxy)"]["Water Stress"] = wri_future.get("ws4028tl", "N/A")
-    scenarios["+30Y (Optimistic Proxy)"]["Water Stress"] = "N/A (Limit 2040)"
-    scenarios["+30Y (BAU Proxy)"]["Water Stress"] = "N/A (Limit 2040)"
+    scenarios["+10Y (Optimistic)"]["Water Stress"] = wri_future.get("ws3024tl", "N/A")
+    scenarios["+10Y (BAU)"]["Water Stress"] = wri_future.get("ws3028tl", "N/A")
+    scenarios["+20Y (Optimistic)"]["Water Stress"] = wri_future.get("ws4024tl", "N/A")
+    scenarios["+20Y (BAU)"]["Water Stress"] = wri_future.get("ws4028tl", "N/A")
+    scenarios["+30Y (Optimistic)"]["Water Stress"] = "N/A (Limit 2040)"
+    scenarios["+30Y (BAU)"]["Water Stress"] = "N/A (Limit 2040)"
 
     progress.progress(100)
     
-    # --- OUTPUT DISPLAY ---
     st.divider()
-    
     st.subheader("⚠️ Current Hazard Profile")
     c1, c2, c3 = st.columns(3)
     c1.metric("Drought Risk", drought)
@@ -236,9 +210,9 @@ if st.button("Generate Full Risk Report"):
     
     cols_order = [
         "Current (Baseline)", 
-        "+10Y (Optimistic Proxy)", "+10Y (BAU Proxy)",
-        "+20Y (Optimistic Proxy)", "+20Y (BAU Proxy)",
-        "+30Y (Optimistic Proxy)", "+30Y (BAU Proxy)"
+        "+10Y (Optimistic)", "+10Y (BAU)",
+        "+20Y (Optimistic)", "+20Y (BAU)",
+        "+30Y (Optimistic)", "+30Y (BAU)"
     ]
     
     table_data = []
