@@ -1,68 +1,56 @@
-import streamlit as st
 import requests
+import json
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="Water Stress Checker")
-st.title("💧 Baseline Water Stress Lookup")
-st.markdown("Checks **WRI Aqueduct 4.0** data via the Resource Watch API.")
+def get_aqueduct_data():
+    # 1. Search for the specific Aqueduct dataset
+    search_url = "https://api.resourcewatch.org/v1/dataset"
+    search_params = {
+        "name": "Aqueduct Baseline Water Stress",
+        "published": "true",
+        "limit": 1,  # We only want the top match
+        "includes": "metadata"
+    }
 
-# --- INPUTS ---
-col1, col2 = st.columns(2)
-lat = col1.number_input("Latitude", value=51.5074, format="%.4f")
-lon = col2.number_input("Longitude", value=-0.1278, format="%.4f")
-
-# --- THE LOGIC ---
-def get_water_stress(lat, lon):
-    # 1. CONSTANTS
-    # This is the UUID for "Aqueduct Baseline Water Stress"
-    DATASET_ID = "c66d7f3a-d1a8-488f-af8b-302b0f2c3840"
+    print("🔍 Searching for 'Aqueduct Baseline Water Stress'...")
     
     try:
-        # 2. STEP 1: GET THE TABLE NAME
-        # We ask the API: "What is the current table name for this dataset?"
-        metadata_url = f"https://api.resourcewatch.org/v1/dataset/{DATASET_ID}"
-        r_meta = requests.get(metadata_url).json()
-        table_name = r_meta['data']['attributes']['tableName']
+        # SEARCH REQUEST
+        response = requests.get(search_url, params=search_params)
+        response.raise_for_status() # Raises error if 400/500
         
-        # 3. STEP 2: QUERY THE DATA
-        # We write a SQL query to find the polygon ('the_geom') that contains our point.
-        # ST_Intersects(the_geom, ST_SetSRID(ST_Point(lon, lat), 4326)) matches the point to the shape.
-        sql = f"""
-            SELECT bws_label, bws_score 
-            FROM {table_name} 
-            WHERE ST_Intersects(the_geom, ST_SetSRID(ST_Point({lon}, {lat}), 4326))
-        """
-        
-        query_url = f"https://api.resourcewatch.org/v1/query?sql={sql}"
-        r_data = requests.get(query_url).json()
-        
-        # 4. PARSE RESULT
-        data = r_data.get('data', [])
-        if len(data) > 0:
-            return data[0] # Return the first match
-        else:
-            return None # Point is in the ocean or outside coverage
-            
-    except Exception as e:
-        st.error(f"API Error: {e}")
-        return None
+        datasets = response.json().get('data', [])
+        if not datasets:
+            print("❌ No dataset found. The API might use a different name.")
+            return
 
-# --- EXECUTION ---
-if st.button("Check Water Stress", type="primary"):
-    with st.spinner("Querying Resource Watch Database..."):
-        result = get_water_stress(lat, lon)
+        # Get the ID of the first result
+        target_id = datasets[0]['id']
+        target_name = datasets[0]['attributes']['name']
+        print(f"✅ Found Dataset: {target_name}")
+        print(f"🆔 UUID: {target_id}")
+
+        # 2. Try to fetch actual data (The "API Key" Test)
+        # We ask for just 1 row to test access
+        print("\n🧪 Testing data access (Querying 1 row)...")
+        query_url = f"https://api.resourcewatch.org/v1/query/{target_id}"
+        query_params = {
+            "sql": "SELECT * FROM data LIMIT 1"  # SQL-like query supported by WRI
+        }
+
+        data_response = requests.get(query_url, params=query_params)
         
-        if result:
-            label = result.get('bws_label', 'Unknown')
-            score = result.get('bws_score', 'N/A')
-            
-            # Simple color coding
-            color = "green"
-            if "High" in label: color = "orange"
-            if "Extremely High" in label: color = "red"
-            
-            st.success(f"**Found Basin Data!**")
-            st.markdown(f"### Stress Level: :{color}[{label}]")
-            st.metric("Risk Score (0-5)", score)
+        if data_response.status_code == 200:
+            print("🎉 SUCCESS! Data retrieved without an API key.")
+            print("-" * 30)
+            print(json.dumps(data_response.json(), indent=2))
+        elif data_response.status_code in [401, 403]:
+            print("🔒 ACCESS DENIED. You were right - an API Key is required for data.")
         else:
-            st.warning("No data found for this location. (Likely ocean or remote area)")
+            print(f"⚠️ Unexpected Status: {data_response.status_code}")
+            print(data_response.text)
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+if __name__ == "__main__":
+    get_aqueduct_data()
