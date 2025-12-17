@@ -1,0 +1,7 @@
+streamlit
+pandas
+requests
+openmeteo-requests
+requests-cache
+retry_requests
+altair
