@@ -7,7 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------
-# 0. PASSWORD PROTECTION (Matches your Streamlit Secrets)
+# 0. PASSWORD PROTECTION
 # ---------------------------------------------------------
 def check_password():
     def password_entered():
@@ -49,7 +49,7 @@ RISK_CONFIG = {
 FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 
 # ---------------------------------------------------------
-# 3. BACKEND API FETCHERS (RE-STABILIZED)
+# 3. BACKEND API FETCHERS
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_wri_current(lat, lon, risk_name):
@@ -78,13 +78,7 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     url = "https://climate-api.open-meteo.com/v1/climate"
     models = ["EC_Earth3P_HR", "MPI_ESM1_2_XR", "MRI_AGCM3_2_S", "FGOALS_f3_H", "CMCC_CM2_VHR4"]
-    params = {
-        "latitude": lat, "longitude": lon, 
-        "start_date": "1950-01-01", "end_date": "2050-12-31", 
-        "models": models, 
-        "daily": ["temperature_2m_mean", "precipitation_sum"], 
-        "disable_downscaling": "false"
-    }
+    params = {"latitude": lat, "longitude": lon, "start_date": "1950-01-01", "end_date": "2050-12-31", "models": models, "daily": ["temperature_2m_mean", "precipitation_sum"], "disable_downscaling": "false"}
     try:
         r = http.get(url, params=params, timeout=30)
         if r.status_code == 429: return generate_mock_climate_data()
@@ -95,9 +89,11 @@ def fetch_climate_projections(lat, lon):
         df["time"] = pd.to_datetime(df["time"])
         df.set_index("time", inplace=True)
         
-        # FIX: Explicitly handle numeric data and drop NaNs to prevent N/A cascade
         t_cols = [c for c in df.columns if "temperature" in c]
         p_cols = [c for c in df.columns if "precipitation" in c]
+        
+        # Track model health
+        active_models = [c.replace("temperature_2m_mean_", "") for c in t_cols if not df[c].isnull().all()]
         
         df["Temp_Mean"] = df[t_cols].mean(axis=1, skipna=True)
         df["Precip_Mean"] = df[p_cols].mean(axis=1, skipna=True)
@@ -106,6 +102,7 @@ def fetch_climate_projections(lat, lon):
         annual["Temp_Mean"] = df["Temp_Mean"].resample("Y").mean()
         annual["Precip_Mean"] = df["Precip_Mean"].resample("Y").sum()
         annual.attrs['is_mock'] = False 
+        annual.attrs['active_models'] = active_models
         return annual
     except: return None
 
@@ -113,6 +110,7 @@ def generate_mock_climate_data():
     dates = pd.date_range(start="1950-01-01", end="2050-12-31", freq="Y")
     df = pd.DataFrame({"Temp_Mean": np.linspace(15, 18, len(dates)), "Precip_Mean": np.random.normal(200, 10, len(dates))}, index=dates)
     df.attrs['is_mock'] = True
+    df.attrs['active_models'] = ["SIMULATED_DATA"]
     return df
 
 # ---------------------------------------------------------
@@ -126,7 +124,8 @@ def analyze_location(lat, lon):
         "Temp_Base": "N/A", "Prec_Base": "N/A",
         "Temp_2035": "N/A", "Prec_2035": "N/A",
         "Temp_2045": "N/A", "Prec_2045": "N/A",
-        "Temp_2050": "N/A", "Prec_2050": "N/A"
+        "Temp_2050": "N/A", "Prec_2050": "N/A",
+        "Models": []
     }
     
     row["Drought"] = fetch_wri_current(lat, lon, "Drought Risk")
@@ -135,13 +134,11 @@ def analyze_location(lat, lon):
     row["BWS"] = fetch_wri_current(lat, lon, "Baseline Water Stress")
     
     fw = fetch_wri_future(lat, lon)
-    row.update({
-        "WS30_Opt": fw.get("ws3024tl","N/A"), "WS30_BAU": fw.get("ws3028tl","N/A"), 
-        "WS40_Opt": fw.get("ws4024tl","N/A"), "WS40_BAU": fw.get("ws4028tl","N/A")
-    })
+    row.update({"WS30_Opt": fw.get("ws3024tl","N/A"), "WS30_BAU": fw.get("ws3028tl","N/A"), "WS40_Opt": fw.get("ws4024tl","N/A"), "WS40_BAU": fw.get("ws4028tl","N/A")})
     
     clim = fetch_climate_projections(lat, lon)
     if clim is not None:
+        row["Models"] = clim.attrs.get('active_models', [])
         suff = " (SIM)" if clim.attrs.get('is_mock', False) else ""
         base = clim.loc["1990":"2020"]
         if not base.empty:
@@ -187,6 +184,13 @@ with t1:
         
         st.divider()
         st.subheader("🔮 Projected Trends (Ensemble Mean)")
+        
+        # MODEL STATUS INDICATOR
+        if res["Models"]:
+            st.caption(f"✅ Data derived from ensemble of {len(res['Models'])} models: {', '.join(res['Models'])}")
+        else:
+            st.caption("❌ No climate model data available for this location.")
+
         table = [
             {"Metric": "Temp", "Current": res.get("Temp_Base"), "+10Y (2035)": res.get("Temp_2035"), "+20Y (2045)": res.get("Temp_2045"), "+30Y (2050)": res.get("Temp_2050")},
             {"Metric": "Precip", "Current": res.get("Prec_Base"), "+10Y (2035)": res.get("Prec_2035"), "+20Y (2045)": res.get("Prec_2045"), "+30Y (2050)": res.get("Prec_2050")},
