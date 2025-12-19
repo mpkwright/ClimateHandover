@@ -6,3 +6,4 @@ requests-cache
 retry_requests
 altair
 geopy
+reverse_geocoder
