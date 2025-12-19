@@ -3,12 +3,13 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ---------------------------------------------------------
 # 0. PASSWORD PROTECTION
 # ---------------------------------------------------------
 def check_password():
-    """Returns `True` if the user had the correct password."""
     def password_entered():
         if st.session_state["password"] == st.secrets["app_password"]:
             st.session_state["password_correct"] = True
@@ -30,7 +31,23 @@ if not check_password():
     st.stop()
 
 # ---------------------------------------------------------
-# 1. CONFIGURATION & UUIDs
+# 1. ROBUST CONNECTION CONFIGURATION
+# ---------------------------------------------------------
+def get_robust_session():
+    """Creates a session that identifies as a browser and retries on blips."""
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    # Browsers are less likely to be throttled than "python-requests"
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    return session
+
+http = get_robust_session()
+
+# ---------------------------------------------------------
+# 2. CONFIGURATION & UUIDs
 # ---------------------------------------------------------
 RISK_CONFIG = {
     "Baseline Water Stress": {"uuid": "c66d7f3a-d1a8-488f-af8b-302b0f2c3840", "cols": ["bws_score", "bws_label"]},
@@ -41,7 +58,7 @@ RISK_CONFIG = {
 FUTURE_WATER_ID = "2a571044-1a31-4092-9af8-48f406f13072"
 
 # ---------------------------------------------------------
-# 2. BACKEND API FETCHERS
+# 3. BACKEND API FETCHERS
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
 def fetch_wri_current(lat, lon, risk_name):
@@ -49,7 +66,7 @@ def fetch_wri_current(lat, lon, risk_name):
     uuid, (s_col, l_col) = config['uuid'], config['cols']
     sql = f"SELECT {s_col}, {l_col} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     try:
-        r = requests.get(f"https://api.resourcewatch.org/v1/query/{uuid}", params={"sql": sql}, timeout=5)
+        r = http.get(f"https://api.resourcewatch.org/v1/query/{uuid}", params={"sql": sql}, timeout=15)
         if r.status_code == 200:
             data = r.json().get('data', [])
             if data: return data[0].get(l_col, "N/A")
@@ -60,7 +77,7 @@ def fetch_wri_current(lat, lon, risk_name):
 def fetch_wri_future(lat, lon):
     sql = f"SELECT ws3024tr, ws3024tl, ws3028tr, ws3028tl, ws4024tr, ws4024tl, ws4028tr, ws4028tl FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
     try:
-        r = requests.get(f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}", params={"sql": sql}, timeout=5)
+        r = http.get(f"https://api.resourcewatch.org/v1/query/{FUTURE_WATER_ID}", params={"sql": sql}, timeout=15)
         if r.status_code == 200:
             data = r.json().get('data', [])
             if data:
@@ -87,7 +104,7 @@ def fetch_climate_projections(lat, lon):
     models = ["ec_earth3_cc", "gfdl_esm4", "ips_cm6a_lr", "mpi_esm1_2_hr", "mri_esm2_0"]
     params = {"latitude": lat, "longitude": lon, "start_date": "1950-01-01", "end_date": "2050-12-31", "models": models, "daily": ["temperature_2m_mean", "precipitation_sum"], "disable_downscaling": "false"}
     try:
-        r = requests.get(url, params=params, timeout=25)
+        r = http.get(url, params=params, timeout=30)
         if r.status_code == 429: return generate_mock_climate_data()
         if r.status_code != 200: return None
         data = r.json()
@@ -111,18 +128,36 @@ def generate_mock_climate_data():
     return df
 
 # ---------------------------------------------------------
-# 3. ANALYSIS ENGINE (FLAT DATA)
+# 4. ANALYSIS ENGINE (STABILITY & INITIALIZATION)
 # ---------------------------------------------------------
 def analyze_location(lat, lon):
-    row = {"Latitude": lat, "Longitude": lon, "Drought": fetch_wri_current(lat, lon, "Drought Risk"), "Riverine": fetch_wri_current(lat, lon, "Riverine Flood"), "Coastal": fetch_wri_current(lat, lon, "Coastal Flood"), "BWS": fetch_wri_current(lat, lon, "Baseline Water Stress")}
+    # Initialize dictionary to prevent KeyError if an API fails
+    row = {
+        "Latitude": lat, "Longitude": lon, 
+        "Drought": "N/A", "Riverine": "N/A", "Coastal": "N/A", "BWS": "N/A",
+        "WS30_Opt": "N/A", "WS30_BAU": "N/A", "WS40_Opt": "N/A", "WS40_BAU": "N/A",
+        "Temp_Base": "N/A", "Prec_Base": "N/A",
+        "Temp_2035": "N/A", "Prec_2035": "N/A",
+        "Temp_2045": "N/A", "Prec_2045": "N/A",
+        "Temp_2050": "N/A", "Prec_2050": "N/A"
+    }
+    
+    row["Drought"] = fetch_wri_current(lat, lon, "Drought Risk")
+    row["Riverine"] = fetch_wri_current(lat, lon, "Riverine Flood")
+    row["Coastal"] = fetch_wri_current(lat, lon, "Coastal Flood")
+    row["BWS"] = fetch_wri_current(lat, lon, "Baseline Water Stress")
+    
     fw = fetch_wri_future(lat, lon)
     row.update({"WS30_Opt": fw.get("ws3024tl","N/A"), "WS30_BAU": fw.get("ws3028tl","N/A"), "WS40_Opt": fw.get("ws4024tl","N/A"), "WS40_BAU": fw.get("ws4028tl","N/A")})
+    
     clim = fetch_climate_projections(lat, lon)
     if clim is not None:
         suff = " (SIM)" if clim.attrs.get('is_mock', False) else ""
         base = clim.loc["1990":"2020"]
-        row["Temp_Base"] = f"{base['Temp_Mean'].mean():.1f}C{suff}"
-        row["Prec_Base"] = f"{base['Precip_Mean'].mean():.0f}mm{suff}"
+        if not base.empty:
+            row["Temp_Base"] = f"{base['Temp_Mean'].mean():.1f}C{suff}"
+            row["Prec_Base"] = f"{base['Precip_Mean'].mean():.0f}mm{suff}"
+        
         def get_c(y, col, is_s=False):
             try:
                 v = clim.loc[str(y-2):str(y+2)][col].mean()
@@ -134,7 +169,7 @@ def analyze_location(lat, lon):
     return row
 
 # ---------------------------------------------------------
-# 4. FRONTEND UI
+# 5. FRONTEND UI
 # ---------------------------------------------------------
 st.set_page_config(page_title="Climate Risk Intelligence", page_icon="🌍", layout="wide")
 st.title("🌍 Integrated Climate Risk Assessment")
@@ -160,10 +195,10 @@ with t1:
         st.divider()
         st.subheader("🔮 Projected Trends")
         table = [
-            {"Metric": "Temp", "Current": res["Temp_Base"], "+10Y (2035)": res["Temp_2035"], "+20Y (2045)": res["Temp_2045"], "+30Y (2050)": res["Temp_2050"]},
-            {"Metric": "Precip", "Current": res["Prec_Base"], "+10Y (2035)": res["Prec_2035"], "+20Y (2045)": res["Prec_2045"], "+30Y (2050)": res["Prec_2050"]},
-            {"Metric": "WS (Opt)", "Current": res["BWS"], "+10Y (2035)": res["WS30_Opt"], "+20Y (2045)": res["WS40_Opt"], "+30Y (2050)": "N/A"},
-            {"Metric": "WS (BAU)", "Current": res["BWS"], "+10Y (2035)": res["WS30_BAU"], "+20Y (2045)": res["WS40_BAU"], "+30Y (2050)": "N/A"}
+            {"Metric": "Temp", "Current": res.get("Temp_Base", "N/A"), "+10Y (2035)": res.get("Temp_2035", "N/A"), "+20Y (2045)": res.get("Temp_2045", "N/A"), "+30Y (2050)": res.get("Temp_2050", "N/A")},
+            {"Metric": "Precip", "Current": res.get("Prec_Base", "N/A"), "+10Y (2035)": res.get("Prec_2035", "N/A"), "+20Y (2045)": res.get("Prec_2045", "N/A"), "+30Y (2050)": res.get("Prec_2050", "N/A")},
+            {"Metric": "WS (Opt)", "Current": res.get("BWS", "N/A"), "+10Y (2035)": res.get("WS30_Opt", "N/A"), "+20Y (2045)": res.get("WS40_Opt", "N/A"), "+30Y (2050)": "N/A"},
+            {"Metric": "WS (BAU)", "Current": res.get("BWS", "N/A"), "+10Y (2035)": res.get("WS30_BAU", "N/A"), "+20Y (2045)": res.get("WS40_BAU", "N/A"), "+30Y (2050)": "N/A"}
         ]
         st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
 
