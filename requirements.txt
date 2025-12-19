@@ -9,3 +9,6 @@ geopy
 reverse_geocoder
 xarray
 s3fs
+netCDF4
+h5netcdf
+numpy
