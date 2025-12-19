@@ -78,7 +78,8 @@ def fetch_wri_future(lat, lon):
 def fetch_climate_projections(lat, lon):
     url = "https://climate-api.open-meteo.com/v1/climate"
     models = ["EC_Earth3P_HR", "MPI_ESM1_2_XR", "MRI_AGCM3_2_S", "FGOALS_f3_H", "CMCC_CM2_VHR4"]
-    params = {"latitude": lat, "longitude": lon, "start_date": "1950-01-01", "end_date": "2050-12-31", "models": models, "daily": ["temperature_2m_mean", "precipitation_sum"], "disable_downscaling": "false"}
+    # REDUCED WINDOW for batch stability: 1990 to 2050 only
+    params = {"latitude": lat, "longitude": lon, "start_date": "1990-01-01", "end_date": "2050-12-31", "models": models, "daily": ["temperature_2m_mean", "precipitation_sum"], "disable_downscaling": "false"}
     try:
         r = http.get(url, params=params, timeout=30)
         if r.status_code == 429: return generate_mock_climate_data()
@@ -92,7 +93,6 @@ def fetch_climate_projections(lat, lon):
         t_cols = [c for c in df.columns if "temperature" in c]
         p_cols = [c for c in df.columns if "precipitation" in c]
         
-        # Track model health
         active_models = [c.replace("temperature_2m_mean_", "") for c in t_cols if not df[c].isnull().all()]
         
         df["Temp_Mean"] = df[t_cols].mean(axis=1, skipna=True)
@@ -107,7 +107,7 @@ def fetch_climate_projections(lat, lon):
     except: return None
 
 def generate_mock_climate_data():
-    dates = pd.date_range(start="1950-01-01", end="2050-12-31", freq="Y")
+    dates = pd.date_range(start="1990-01-01", end="2050-12-31", freq="Y")
     df = pd.DataFrame({"Temp_Mean": np.linspace(15, 18, len(dates)), "Precip_Mean": np.random.normal(200, 10, len(dates))}, index=dates)
     df.attrs['is_mock'] = True
     df.attrs['active_models'] = ["SIMULATED_DATA"]
@@ -174,30 +174,23 @@ with t1:
     if st.button("Generate Risk Report"):
         with st.spinner("Analyzing..."):
             res = analyze_location(lat_in, lon_in)
-        
         st.divider()
         st.subheader("⚠️ Current Hazard Profile")
         c1, c2, c3 = st.columns(3)
         c1.metric("Drought", res["Drought"])
         c2.metric("Riverine", res["Riverine"])
         c3.metric("Coastal", res["Coastal"])
-        
         st.divider()
         st.subheader("🔮 Projected Trends (Ensemble Mean)")
-        
-        # MODEL STATUS INDICATOR
-        if res["Models"]:
-            st.caption(f"✅ Data derived from ensemble of {len(res['Models'])} models: {', '.join(res['Models'])}")
-        else:
-            st.caption("❌ No climate model data available for this location.")
-
+        if res["Models"]: st.caption(f"✅ Data derived from ensemble of {len(res['Models'])} models: {', '.join(res['Models'])}")
         table = [
             {"Metric": "Temp", "Current": res.get("Temp_Base"), "+10Y (2035)": res.get("Temp_2035"), "+20Y (2045)": res.get("Temp_2045"), "+30Y (2050)": res.get("Temp_2050")},
             {"Metric": "Precip", "Current": res.get("Prec_Base"), "+10Y (2035)": res.get("Prec_2035"), "+20Y (2045)": res.get("Prec_2045"), "+30Y (2050)": res.get("Prec_2050")},
             {"Metric": "WS (Opt)", "Current": res["BWS"], "+10Y (2035)": res["WS30_Opt"], "+20Y (2045)": res["WS40_Opt"], "+30Y (2050)": "N/A"},
             {"Metric": "WS (BAU)", "Current": res["BWS"], "+10Y (2035)": res["WS30_BAU"], "+20Y (2045)": res["WS40_BAU"], "+30Y (2050)": "N/A"}
         ]
-        st.dataframe(pd.DataFrame(table), use_container_width=True, hide_index=True)
+        # FIX: Updated to width='stretch' per streamlit logs
+        st.dataframe(pd.DataFrame(table), width='stretch', hide_index=True)
 
 with t2:
     st.markdown("### 📥 Bulk Analysis")
@@ -211,11 +204,18 @@ with t2:
             for i, r in df_in.iterrows():
                 status.text(f"Processing {i+1}/{len(df_in)}...")
                 res = analyze_location(r['latitude'], r['longitude'])
+                
+                # BATCH STABILITY FIX: Deep retry on N/A
+                if res["Temp_Base"] == "N/A":
+                    time.sleep(3.0)
+                    res = analyze_location(r['latitude'], r['longitude'])
+                
                 if 'id' in r: res['ID'] = r['id']
                 results.append(res)
                 prog.progress((i+1)/len(df_in))
-                time.sleep(0.5)
+                time.sleep(1.2) 
             df_res = pd.DataFrame(results)
             st.success("Batch Complete!")
-            st.dataframe(df_res)
+            # FIX: Updated to width='stretch'
+            st.dataframe(df_res, width='stretch')
             st.download_button("💾 Download Results", df_res.to_csv(index=False).encode('utf-8'), "risk_results.csv", "text/csv")
