@@ -41,11 +41,11 @@ def load_wb_db():
 
 WB_DB = load_wb_db()
 
-# 3. CUSTOM STYLING
+# 3. CUSTOM STYLING (Smaller hazard fonts to prevent cutoff)
 st.markdown("""
     <style>
-    [data-testid="stMetricValue"] { font-size: 1.5rem !important; font-weight: 700; }
-    [data-testid="stMetricLabel"] { font-size: 0.9rem !important; }
+    [data-testid="stMetricValue"] { font-size: 1.1rem !important; font-weight: 700; }
+    [data-testid="stMetricLabel"] { font-size: 0.85rem !important; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -61,7 +61,7 @@ def analyze_point(lat, lon, manual_id=None):
     iso3 = ISO_MAP.get(loc_info['cc'], "USA")
     target_id = manual_id if manual_id else iso3
     
-    # Identify available sub-regions for this country to help the user
+    # Identify available sub-regions for this country
     sub_regions = [k for k in WB_DB['data']['tas']['2020-2039']['ssp245'].keys() if k.startswith(iso3)]
     
     res = {"Location": f"{loc_info['name']}, {loc_info['cc']}", "ID": target_id, "SubRegions": sub_regions}
@@ -73,15 +73,17 @@ def analyze_point(lat, lon, manual_id=None):
         "Riverine Flood": "df9ef304-672f-4c17-97f4-f9f8fa2849ff",
         "Coastal Flood": "d39919a9-0940-4038-87ac-662f944bc846"
     }
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=Retry(total=3)))
+    
     for name, uuid in RISK_CONFIG.items():
         sql = f"SELECT * FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
         try:
-            r = requests.get(f"https://api.resourcewatch.org/v1/query/{uuid}", params={"sql": sql}, timeout=5)
-            # Find the first label column
+            r = session.get(f"https://api.resourcewatch.org/v1/query/{uuid}", params={"sql": sql}, timeout=5)
             val = "N/A"
             if r.json().get('data'):
-                row = r.json()['data'][0]
-                val = next((v for k, v in row.items() if 'label' in k.lower()), "N/A")
+                row_data = r.json()['data'][0]
+                val = next((v for k, v in row_data.items() if 'label' in k.lower()), "N/A")
             res[name] = val
         except: res[name] = "N/A"
 
@@ -93,71 +95,80 @@ def analyze_point(lat, lon, manual_id=None):
     return res
 
 # 5. UI TABS
-st.set_page_config(page_title="Risk Dashboard", layout="wide")
-st.title("🌍 Integrated Climate & Hazard Analysis")
+st.set_page_config(page_title="Climate Intelligence Dashboard", layout="wide")
+st.title("🌍 Integrated Climate & Hazard Risk Portal")
 
-t1, t2 = st.tabs(["📍 Analysis", "🚀 Batch Processing"])
+t1, t2 = st.tabs(["📍 Single Location", "🚀 Batch Processing"])
 
 with t1:
     with st.sidebar:
-        st.header("📍 Settings")
-        lat_in = st.number_input("Lat", value=25.2048, format="%.4f")
-        lon_in = st.number_input("Lon", value=55.2708, format="%.4f")
+        st.header("📍 Location Parameters")
+        lat_in = st.number_input("Latitude", value=25.2048, format="%.4f")
+        lon_in = st.number_input("Longitude", value=55.2708, format="%.4f")
         sid_in = st.text_input("GADM ID (Optional)", placeholder="e.g. ARE.2553173")
-        if st.button("Run Report"):
+        if st.button("Generate Risk Report"):
             st.session_state.data = analyze_point(lat_in, lon_in, sid_in)
 
     if 'data' in st.session_state:
         d = st.session_state.data
         st.map(pd.DataFrame({'lat': [lat_in], 'lon': [lon_in]}), zoom=7)
         
-        st.info(f"📍 Country Detected: **{d['Location']}**. Available IDs in JSON: `{', '.join(d['SubRegions'][:10])}...`")
-        st.subheader(f"Results for ID: {d['ID']}")
+        st.info(f"📍 Detected Location: **{d['Location']}**. Sub-Regions in JSON: `{', '.join(d['SubRegions'][:10])}...`")
+        st.subheader(f"Current & Projected Risks for ID: {d['ID']}")
         
-        # HAZARDS
-        h1, h2 = st.columns(2)
-        h3, h4 = st.columns(2)
-        h1.metric("🌊 Water Stress", d.get("Baseline Water Stress", "N/A"))
-        h2.metric("🏜️ Drought Risk", d.get("Drought Risk", "N/A"))
-        h3.metric("🏠 Riverine Flood", d.get("Riverine Flood", "N/A"))
-        h4.metric("🏖️ Coastal Flood", d.get("Coastal Flood", "N/A"))
+        # HAZARDS - SPLIT OVER 2 ROWS FOR FONT VISIBILITY
+        h_row1 = st.columns(2)
+        h_row2 = st.columns(2)
+        h_row1[0].metric("🌊 Water Stress", d.get("Baseline Water Stress", "N/A"))
+        h_row1[1].metric("🏜️ Drought Risk", d.get("Drought Risk", "N/A"))
+        h_row2[0].metric("🏠 Riverine Flood", d.get("Riverine Flood", "N/A"))
+        h_row2[1].metric("🏖️ Coastal Flood", d.get("Coastal Flood", "N/A"))
 
         st.divider()
-        st.subheader("🔮 Projected Trends (From Local JSON)")
+        st.subheader("🔮 Climate Projections (All JSON Scenarios)")
         
-        # PROJECTION TABLE
+        # PROJECTION TABLE (Fixed 'r' bug and added SSP126)
         def fm(v, u): return f"{v:.2f}{u}" if v is not None else "N/A"
         res_table = [
             {"Scenario": "Optimistic (SSP1-2.6)", "Temp +10Y": fm(d['tas_ssp126_2020-2039'], "C"), "Temp +25Y": fm(d['tas_ssp126_2040-2059'], "C"), "Prec +10Y": fm(d['pr_ssp126_2020-2039'], "mm"), "Prec +25Y": fm(d['pr_ssp126_2040-2059'], "mm")},
-            {"Scenario": "Moderate (SSP2-4.5)", "Temp +10Y": fm(d['tas_ssp245_2020-2039'], "C"), "Temp +25Y": fm(d['tas_ssp245_2040-2059'], "C"), "Prec +10Y": fm(d['pr_ssp245_2020-2039'], "mm"), "Prec +25Y": fm(r['pr_ssp245_2040-2059'], "mm")},
+            {"Scenario": "Moderate (SSP2-4.5)", "Temp +10Y": fm(d['tas_ssp245_2020-2039'], "C"), "Temp +25Y": fm(d['tas_ssp245_2040-2059'], "C"), "Prec +10Y": fm(d['pr_ssp245_2020-2039'], "mm"), "Prec +25Y": fm(d['pr_ssp245_2040-2059'], "mm")},
             {"Scenario": "High Risk (SSP3-7.0)", "Temp +10Y": fm(d['tas_ssp370_2020-2039'], "C"), "Temp +25Y": fm(d['tas_ssp370_2040-2059'], "C"), "Prec +10Y": fm(d['pr_ssp370_2020-2039'], "mm"), "Prec +25Y": fm(d['pr_ssp370_2040-2059'], "mm")}
         ]
         st.table(pd.DataFrame(res_table))
 
-        # CHARTS
+        # TRIPLE-SCENARIO CHARTS
         c1, c2 = st.columns(2)
         with c1:
             st.write("**Temperature Pathways (C)**")
-            st.line_chart(pd.DataFrame({
+            t_df = pd.DataFrame({
                 "SSP1-2.6": [d['tas_ssp126_2020-2039'], d['tas_ssp126_2040-2059']],
                 "SSP2-4.5": [d['tas_ssp245_2020-2039'], d['tas_ssp245_2040-2059']],
                 "SSP3-7.0": [d['tas_ssp370_2020-2039'], d['tas_ssp370_2040-2059']]
-            }, index=[2030, 2050]))
+            }, index=[2030, 2050])
+            st.line_chart(t_df)
         with c2:
             st.write("**Precipitation Pathways (mm)**")
-            st.line_chart(pd.DataFrame({
+            p_df = pd.DataFrame({
                 "SSP1-2.6": [d['pr_ssp126_2020-2039'], d['pr_ssp126_2040-2059']],
                 "SSP2-4.5": [d['pr_ssp245_2020-2039'], d['pr_ssp245_2040-2059']],
                 "SSP3-7.0": [d['pr_ssp370_2020-2039'], d['pr_ssp370_2040-2059']]
-            }, index=[2030, 2050]))
+            }, index=[2030, 2050])
+            st.line_chart(p_df)
 
 with t2:
-    st.markdown("### 📥 Bulk Processing")
-    up = st.file_uploader("Upload CSV (latitude, longitude required)", type=["csv"])
-    if up:
-        df_in = pd.read_csv(up)
-        if st.button("Run Batch"):
+    st.markdown("### 📥 Bulk Analysis Tool")
+    st.info("Upload a CSV with 'latitude' and 'longitude' columns to process multiple sites against the local JSON database.")
+    up_csv = st.file_uploader("Upload CSV", type=["csv"])
+    if up_csv:
+        df_in = pd.read_csv(up_csv)
+        if st.button("Run Batch Processing"):
             results = []
-            for i, r in df_in.iterrows():
-                results.append(analyze_point(r['latitude'], r['longitude']))
-            st.dataframe(pd.DataFrame(results))
+            progress = st.progress(0)
+            for i, row in df_in.iterrows():
+                results.append(analyze_point(row['latitude'], row['longitude']))
+                progress.progress((i + 1) / len(df_in))
+            
+            df_final = pd.DataFrame(results)
+            st.success("Batch Processing Complete!")
+            st.dataframe(df_final, use_container_width=True)
+            st.download_button("💾 Download Batch Results", df_final.to_csv(index=False).encode('utf-8'), "climate_risk_batch.csv", "text/csv")
