@@ -8,3 +8,4 @@ altair
 geopy
 reverse_geocoder
 xarray
+s3fs
