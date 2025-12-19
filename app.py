@@ -3,134 +3,116 @@ import pandas as pd
 import json
 import reverse_geocoder as rg
 import requests
-import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------
-# 1. CORE DATA LOADERS
-# ---------------------------------------------------------
+# 1. DATABASE LOADER
 @st.cache_data
-def load_wb_json():
+def load_wb_db():
     with open("climate_WB_data.json", "r") as f:
         return json.load(f)
 
-WB_DB = load_wb_json()
+WB_DB = load_wb_db()
 
-# WRI Hazard Config (The parts that worked!)
+# 2. HAZARD CONFIG & SESSION
 RISK_CONFIG = {
     "Baseline Water Stress": {"uuid": "c66d7f3a-d1a8-488f-af8b-302b0f2c3840", "cols": ["bws_score", "bws_label"]},
     "Drought Risk":          {"uuid": "5c9507d1-47f7-4c6a-9e64-fc210ccc48e2", "cols": ["drr_score", "drr_label"]},
     "Riverine Flood":        {"uuid": "df9ef304-672f-4c17-97f4-f9f8fa2849ff", "cols": ["rfr_score", "rfr_label"]},
     "Coastal Flood":         {"uuid": "d39919a9-0940-4038-87ac-662f944bc846", "cols": ["cfr_score", "cfr_label"]}
 }
-
 session = requests.Session()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3)))
 
-# ---------------------------------------------------------
-# 2. THE JSON ENGINE (Mapping Coordinates to Sub-Regions)
-# ---------------------------------------------------------
-def get_wb_value(loc_id, var, period, scenario):
+# 3. CUSTOM CSS FOR FONT SIZE (Fixes truncated hazard metrics)
+st.markdown("""
+    <style>
+    [data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+    [data-testid="stMetricLabel"] { font-size: 0.9rem !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# 4. DATA ENGINE
+def get_wb_val(loc_id, var, scenario, period):
     try:
         m_key = '2020-07' if period == '2020-2039' else '2040-07'
         return WB_DB['data'][var][period][scenario][loc_id][m_key]
     except: return None
 
-def find_subregion_id(lat, lon):
-    """Matches coordinates to the most specific ID in the JSON."""
-    loc = rg.search((lat, lon))[0]
-    iso2 = loc['cc']
-    # Add common ISO2 to ISO3 mappings here
-    iso3_map = {"US": "USA", "AF": "AFG", "GB": "GBR", "DE": "DEU", "IN": "IND", "BR": "BRA", "FR": "FRA"}
-    iso3 = iso3_map.get(iso2, "USA")
-    
-    # Check if we can find a sub-region (e.g., USA.5)
-    # This is a fallback to country-level if sub-region logic is too complex for a script
-    return iso3 
-
-# ---------------------------------------------------------
-# 3. ANALYSIS ENGINE
-# ---------------------------------------------------------
-def analyze(lat, lon):
-    loc_id = find_subregion_id(lat, lon)
+def analyze(lat, lon, sub_id):
     loc_info = rg.search((lat, lon))[0]
+    # Simple ISO2 to ISO3 mapping
+    iso3_map = {"US": "USA", "AF": "AFG", "GB": "GBR", "DE": "DEU", "AZ": "AZE", "IN": "IND", "BR": "BRA"}
+    target_id = sub_id if sub_id else iso3_map.get(loc_info['cc'], "USA")
     
-    # Fetching Hazard Data (WRI)
-    hazards = {name: fetch_wri_data(lat, lon, name) for name in RISK_CONFIG.keys()}
+    res = {"Location": f"{loc_info['name']}, {loc_info['cc']}", "ID": target_id}
     
-    # Fetching Climate Data (Actual JSON References)
-    res = {
-        "Location": f"{loc_info['name']}, {loc_info['admin1']}",
-        "ID": loc_id,
-        "Hazards": hazards,
-        "Temp": {
-            "Base": get_wb_value(loc_id, 'tas', '2020-2039', 'ssp126'),
-            "T35_245": get_wb_value(loc_id, 'tas', '2020-2039', 'ssp245'),
-            "T35_370": get_wb_value(loc_id, 'tas', '2020-2039', 'ssp370'),
-            "T50_245": get_wb_value(loc_id, 'tas', '2040-2059', 'ssp245'),
-            "T50_370": get_wb_value(loc_id, 'tas', '2040-2059', 'ssp370')
-        },
-        "Prec": {
-            "Base": get_wb_value(loc_id, 'pr', '2020-2039', 'ssp126'),
-            "P35_245": get_wb_value(loc_id, 'pr', '2020-2039', 'ssp245'),
-            "P35_370": get_wb_value(loc_id, 'pr', '2020-2039', 'ssp370'),
-            "P50_245": get_wb_value(loc_id, 'pr', '2040-2059', 'ssp245'),
-            "P50_370": get_wb_value(loc_id, 'pr', '2040-2059', 'ssp370')
-        }
-    }
+    # Hazard Data (WRI API)
+    for name, cfg in RISK_CONFIG.items():
+        sql = f"SELECT {cfg['cols'][1]} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
+        try:
+            r = session.get(f"https://api.resourcewatch.org/v1/query/{cfg['uuid']}", params={"sql": sql}, timeout=5)
+            res[name] = r.json()['data'][0][cfg['cols'][1]]
+        except: res[name] = "N/A"
+
+    # Climate Data (Actual JSON references)
+    for var in ['tas', 'pr']:
+        for sc in ['ssp126', 'ssp245', 'ssp370']:
+            for prd in ['2020-2039', '2040-2059']:
+                key = f"{var}_{sc}_{prd}"
+                res[key] = get_wb_val(target_id, var, sc, prd)
     return res
 
-def fetch_wri_data(lat, lon, risk):
-    cfg = RISK_CONFIG[risk]
-    sql = f"SELECT {cfg['cols'][1]} FROM data WHERE ST_Intersects(the_geom, ST_GeomFromText('POINT({lon} {lat})', 4326))"
-    try:
-        r = session.get(f"https://api.resourcewatch.org/v1/query/{cfg['uuid']}", params={"sql": sql}, timeout=5)
-        return r.json()['data'][0][cfg['cols'][1]]
-    except: return "N/A"
+# 5. FRONTEND UI
+st.title("🌍 Integrated Climate & Hazard Intelligence")
 
-# ---------------------------------------------------------
-# 4. FRONTEND UI (RESTORING ALL WORKING PARTS)
-# ---------------------------------------------------------
-st.set_page_config(page_title="Risk Dashboard", layout="wide")
-st.title("🌍 Integrated Climate & Hazard Intel")
-
-# RESTORED SIDEBAR MAP & INPUTS
 with st.sidebar:
-    st.header("📍 Settings")
-    lat_in = st.number_input("Lat", value=33.4484, format="%.4f")
-    lon_in = st.number_input("Lon", value=-112.0740, format="%.4f")
-    if st.button("Analyze"):
-        st.session_state.data = analyze(lat_in, lon_in)
+    st.header("📍 Location")
+    lat_v = st.number_input("Lat", value=33.4484, format="%.4f")
+    lon_v = st.number_input("Lon", value=-112.0740, format="%.4f")
+    sid = st.text_input("GADM ID (Optional)", help="e.g. USA.5")
+    if st.button("Generate Report"):
+        st.session_state.rpt = analyze(lat_v, lon_v, sid)
 
-if 'data' in st.session_state:
-    d = st.session_state.data
-    st.map(pd.DataFrame({'lat': [lat_in], 'lon': [lon_in]}), zoom=6)
+if 'rpt' in st.session_state:
+    r = st.session_state.rpt
+    st.map(pd.DataFrame({'lat': [lat_v], 'lon': [lon_v]}), zoom=7)
     
-    st.subheader(f"📍 {d['Location']} (JSON ID: {d['ID']})")
+    st.subheader(f"📍 Analysis for {r['Location']} (ID: {r['ID']})")
     
-    # HAZARD ROW
-    cols = st.columns(4)
-    for i, (name, val) in enumerate(d['Hazards'].items()):
-        cols[i].metric(name, val)
+    # HAZARD METRICS (Now with smaller fonts via CSS)
+    h_cols = st.columns(4)
+    h_cols[0].metric("Water Stress", r["Baseline Water Stress"])
+    h_cols[1].metric("Drought Risk", r["Drought Risk"])
+    h_cols[2].metric("Riverine Flood", r["Riverine Flood"])
+    h_cols[3].metric("Coastal Flood", r["Coastal Flood"])
 
     st.divider()
+    st.subheader("🔮 Climate Projections (Near vs Longer Term)")
     
-    # CLIMATE TABLE
-    st.subheader("🔮 Actual Projections from Local JSON")
-    def f(v, u): return f"{v:.2f}{u}" if v else "N/A"
+    def fm(v, u): return f"{v:.2f}{u}" if v is not None else "N/A"
     
-    res_table = [
-        {"Scenario": "Moderate (SSP2-4.5)", "Temp +10Y": f(d['Temp']['T35_245'], "C"), "Temp +25Y": f(d['Temp']['T50_245'], "C"), "Prec +10Y": f(d['Prec']['P35_245'], "mm")},
-        {"Scenario": "High Risk (SSP3-7.0)", "Temp +10Y": f(d['Temp']['T35_370'], "C"), "Temp +25Y": f(d['Temp']['T50_370'], "C"), "Prec +10Y": f(d['Prec']['P35_370'], "mm")}
+    # Full Table with SSP126, SSP245, and SSP370
+    res_data = [
+        {"Scenario": "Optimistic (SSP1-2.6)", "Temp +10Y": fm(r['tas_ssp126_2020-2039'], "C"), "Temp +25Y": fm(r['tas_ssp126_2040-2059'], "C"), "Prec +10Y": fm(r['pr_ssp126_2020-2039'], "mm"), "Prec +25Y": fm(r['pr_ssp126_2040-2059'], "mm")},
+        {"Scenario": "Moderate (SSP2-4.5)", "Temp +10Y": fm(r['tas_ssp245_2020-2039'], "C"), "Temp +25Y": fm(r['tas_ssp245_2040-2059'], "C"), "Prec +10Y": fm(r['pr_ssp245_2020-2039'], "mm"), "Prec +25Y": fm(r['pr_ssp245_2040-2059'], "mm")},
+        {"Scenario": "High Risk (SSP3-7.0)", "Temp +10Y": fm(r['tas_ssp370_2020-2039'], "C"), "Temp +25Y": fm(r['tas_ssp370_2040-2059'], "C"), "Prec +10Y": fm(r['pr_ssp370_2020-2039'], "mm"), "Prec +25Y": fm(r['pr_ssp370_2040-2059'], "mm")}
     ]
-    st.table(pd.DataFrame(res_table))
+    st.table(pd.DataFrame(res_data))
 
-    # TREND CHARTS
+    # DUAL PATHWAY CHARTS
     c1, c2 = st.columns(2)
     with c1:
-        st.write("**Temp Trend (SSP3-7.0)**")
-        st.line_chart(pd.Series([d['Temp']['Base'], d['Temp']['T35_370'], d['Temp']['T50_370']], index=[2020, 2035, 2050]))
+        st.write("**Temperature Pathways (C)**")
+        t_df = pd.DataFrame({
+            "SSP126": [r['tas_ssp126_2020-2039'], r['tas_ssp126_2040-2059']],
+            "SSP370": [r['tas_ssp370_2020-2039'], r['tas_ssp370_2040-2059']]
+        }, index=[2030, 2050])
+        st.line_chart(t_df)
     with c2:
-        st.write("**Precip Trend (SSP3-7.0)**")
-        st.line_chart(pd.Series([d['Prec']['Base'], d['Prec']['P35_370'], d['Prec']['P50_370']], index=[2020, 2035, 2050]))
+        st.write("**Precipitation Pathways (mm)**")
+        p_df = pd.DataFrame({
+            "SSP126": [r['pr_ssp126_2020-2039'], r['pr_ssp126_2040-2059']],
+            "SSP370": [r['pr_ssp370_2020-2039'], r['pr_ssp370_2040-2059']]
+        }, index=[2030, 2050])
+        st.line_chart(p_df)
