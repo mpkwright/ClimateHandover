@@ -92,7 +92,6 @@ def fetch_climate_projections(lat, lon):
         t_cols = [c for c in df.columns if "temperature" in c]
         p_cols = [c for c in df.columns if "precipitation" in c]
         
-        # Track model health
         active_models = [c.replace("temperature_2m_mean_", "") for c in t_cols if not df[c].isnull().all()]
         
         df["Temp_Mean"] = df[t_cols].mean(axis=1, skipna=True)
@@ -174,23 +173,15 @@ with t1:
     if st.button("Generate Risk Report"):
         with st.spinner("Analyzing..."):
             res = analyze_location(lat_in, lon_in)
-        
         st.divider()
         st.subheader("⚠️ Current Hazard Profile")
         c1, c2, c3 = st.columns(3)
         c1.metric("Drought", res["Drought"])
         c2.metric("Riverine", res["Riverine"])
         c3.metric("Coastal", res["Coastal"])
-        
         st.divider()
         st.subheader("🔮 Projected Trends (Ensemble Mean)")
-        
-        # MODEL STATUS INDICATOR
-        if res["Models"]:
-            st.caption(f"✅ Data derived from ensemble of {len(res['Models'])} models: {', '.join(res['Models'])}")
-        else:
-            st.caption("❌ No climate model data available for this location.")
-
+        if res["Models"]: st.caption(f"✅ Data derived from ensemble of {len(res['Models'])} models: {', '.join(res['Models'])}")
         table = [
             {"Metric": "Temp", "Current": res.get("Temp_Base"), "+10Y (2035)": res.get("Temp_2035"), "+20Y (2045)": res.get("Temp_2045"), "+30Y (2050)": res.get("Temp_2050")},
             {"Metric": "Precip", "Current": res.get("Prec_Base"), "+10Y (2035)": res.get("Prec_2035"), "+20Y (2045)": res.get("Prec_2045"), "+30Y (2050)": res.get("Prec_2050")},
@@ -211,10 +202,16 @@ with t2:
             for i, r in df_in.iterrows():
                 status.text(f"Processing {i+1}/{len(df_in)}...")
                 res = analyze_location(r['latitude'], r['longitude'])
+                
+                # BATCH STABILITY FIX: If climate failed (all N/A), retry once after a pause
+                if res["Temp_Base"] == "N/A":
+                    time.sleep(2.0)
+                    res = analyze_location(r['latitude'], r['longitude'])
+                
                 if 'id' in r: res['ID'] = r['id']
                 results.append(res)
                 prog.progress((i+1)/len(df_in))
-                time.sleep(0.5)
+                time.sleep(1.0) # Increased delay for rate-limit safety
             df_res = pd.DataFrame(results)
             st.success("Batch Complete!")
             st.dataframe(df_res)
