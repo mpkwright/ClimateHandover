@@ -20,7 +20,6 @@ def check_password():
     if st.session_state.get("password_correct", False): return True
     st.title("🔒 Access Protected")
     st.text_input("Please enter the access password", type="password", on_change=password_entered, key="password")
-    
     if "password_correct" in st.session_state and not st.session_state["password_correct"]:
         st.error("😕 Password incorrect")
     return False
@@ -79,10 +78,9 @@ def fetch_wri_future(lat, lon):
     except: return {}
 
 @st.cache_data(ttl=86400)
-def fetch_wb_climate(lat, lon, variable, period, scenario):
+def fetch_wb_climate(iso_code, variable, period, scenario):
+    """World Bank API using ISO code directly."""
     try:
-        cc_res = rg.search((lat, lon))[0]
-        iso_code = cc_res['cc']
         url = f"https://cckpapi.worldbank.org/cckp/v1/cmip6-x0.25_climatology_{variable}_annual_{period}_median_{scenario}_ensemble_all_mean/{iso_code}"
         r = http.get(url, params={"_format": "json"}, timeout=15)
         if r.status_code == 200:
@@ -95,8 +93,13 @@ def fetch_wb_climate(lat, lon, variable, period, scenario):
 # 4. ANALYSIS ENGINE
 # ---------------------------------------------------------
 def analyze_location(lat, lon):
+    # Get ISO Country Code for sense-check
+    cc_res = rg.search((lat, lon))[0]
+    iso_code = cc_res['cc']
+    location_name = f"{cc_res['name']}, {iso_code}"
+
     row = {
-        "Latitude": lat, "Longitude": lon, 
+        "Latitude": lat, "Longitude": lon, "Country_Code": iso_code, "Location": location_name,
         "Drought": "N/A", "Riverine": "N/A", "Coastal": "N/A", "BWS": "N/A",
         "WS30_Opt": "N/A", "WS30_BAU": "N/A", "WS40_Opt": "N/A", "WS40_BAU": "N/A",
         "T_Base": 15.0, "P_Base": 200.0,
@@ -112,15 +115,15 @@ def analyze_location(lat, lon):
     fw = fetch_wri_future(lat, lon)
     row.update({"WS30_Opt": fw.get("ws3024tl","N/A"), "WS30_BAU": fw.get("ws3028tl","N/A"), "WS40_Opt": fw.get("ws4024tl","N/A"), "WS40_BAU": fw.get("ws4028tl","N/A")})
     
-    # Data Fetching
-    row["T35_Opt"] = fetch_wb_climate(lat, lon, 'tas', '2020-2039', 'ssp245')
-    row["T35_BAU"] = fetch_wb_climate(lat, lon, 'tas', '2020-2039', 'ssp585')
-    row["T50_Opt"] = fetch_wb_climate(lat, lon, 'tas', '2040-2059', 'ssp245')
-    row["T50_BAU"] = fetch_wb_climate(lat, lon, 'tas', '2040-2059', 'ssp585')
-    row["P35_Opt"] = fetch_wb_climate(lat, lon, 'pr', '2020-2039', 'ssp245')
-    row["P35_BAU"] = fetch_wb_climate(lat, lon, 'pr', '2020-2039', 'ssp585')
-    row["P50_Opt"] = fetch_wb_climate(lat, lon, 'pr', '2040-2059', 'ssp245')
-    row["P50_BAU"] = fetch_wb_climate(lat, lon, 'pr', '2040-2059', 'ssp585')
+    # Climate Fetching using ISO code
+    row["T35_Opt"] = fetch_wb_climate(iso_code, 'tas', '2020-2039', 'ssp245')
+    row["T35_BAU"] = fetch_wb_climate(iso_code, 'tas', '2020-2039', 'ssp585')
+    row["T50_Opt"] = fetch_wb_climate(iso_code, 'tas', '2040-2059', 'ssp245')
+    row["T50_BAU"] = fetch_wb_climate(iso_code, 'tas', '2040-2059', 'ssp585')
+    row["P35_Opt"] = fetch_wb_climate(iso_code, 'pr', '2020-2039', 'ssp245')
+    row["P35_BAU"] = fetch_wb_climate(iso_code, 'pr', '2020-2039', 'ssp585')
+    row["P50_Opt"] = fetch_wb_climate(iso_code, 'pr', '2040-2059', 'ssp245')
+    row["P50_BAU"] = fetch_wb_climate(iso_code, 'pr', '2040-2059', 'ssp585')
     
     return row
 
@@ -129,7 +132,6 @@ def analyze_location(lat, lon):
 # ---------------------------------------------------------
 st.set_page_config(page_title="Climate Risk Intel", page_icon="🌍", layout="wide")
 st.title("🌍 Integrated Climate Risk Assessment")
-st.info("Climate Projections powered by World Bank CCKP (CMIP6 Ensemble)")
 
 t1, t2 = st.tabs(["📍 Single Location", "🚀 Batch Processing"])
 
@@ -144,33 +146,35 @@ with t1:
             res = analyze_location(lat_in, lon_in)
         
         st.divider()
-        st.subheader("⚠️ Current Hazard Profile")
+        # SENSE CHECK: Display identified location
+        st.subheader(f"📍 Analysis for: {res['Location']}")
+        
         c1, c2, c3 = st.columns(3)
         c1.metric("Drought", res["Drought"])
         c2.metric("Riverine", res["Riverine"])
         c3.metric("Coastal", res["Coastal"])
         
-        # VISUALIZATION SECTION
         st.divider()
         chart_col1, chart_col2 = st.columns(2)
         
         with chart_col1:
             st.subheader("📈 Temperature Pathway")
-            temp_chart = pd.DataFrame({
+            t_chart = pd.DataFrame({
                 "Year": [2010, 2035, 2050],
                 "Optimistic (SSP2-4.5)": [res["T_Base"], res["T35_Opt"], res["T50_Opt"]],
-                "Business as Usual (SSP5-8.5)": [res["T_Base"], res["T35_BAU"], res["T50_BAU"]]
+                "BAU (SSP5-8.5)": [res["T_Base"], res["T35_BAU"], res["T50_BAU"]]
             }).set_index("Year")
-            st.line_chart(temp_chart)
+            st.line_chart(t_chart)
 
+        
         with chart_col2:
             st.subheader("🌧️ Precipitation Pathway")
-            precip_chart = pd.DataFrame({
+            p_chart = pd.DataFrame({
                 "Year": [2010, 2035, 2050],
                 "Optimistic (SSP2-4.5)": [res["P_Base"], res["P35_Opt"], res["P50_Opt"]],
-                "Business as Usual (SSP5-8.5)": [res["P_Base"], res["P35_BAU"], res["P50_BAU"]]
+                "BAU (SSP5-8.5)": [res["P_Base"], res["P35_BAU"], res["P50_BAU"]]
             }).set_index("Year")
-            st.line_chart(precip_chart)
+            st.line_chart(p_chart)
 
         st.divider()
         st.subheader("🔮 Detailed Projections")
